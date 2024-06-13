@@ -40,7 +40,8 @@ struct task_serial_context *task_serial_init()
 
 /* Process all the images in the given host array and return the output in the
  * provided output host array */
-void task_serial_process(struct task_serial_context *context, uchar *images_in, uchar *images_out)
+void task_serial_process(struct task_serial_context *context, uchar *images_in, 
+                         uchar *images_out)
 {
     //TODO: in a for loop:
     //   1. copy the relevant image from images_in to the GPU memory you allocated

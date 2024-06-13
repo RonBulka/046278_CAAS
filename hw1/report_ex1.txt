@@ -1,0 +1,19 @@
+1) knowing the system:
+    a) full output from the nvcc --version command is:
+        nvcc: NVIDIA (R) Cuda compiler driver
+        Copyright (c) 2005-2024 NVIDIA Corporation
+        Built on Wed_Apr_17_19:19:55_PDT_2024
+        Cuda compilation tools, release 12.5, V12.5.40
+        Build cuda_12.5.r12.5/compiler.34177558_0
+    so the cuda version on the remote server is V12.5.40
+    b) The GPU name on the server is NVIDIA GeForce RTX 2080 SUPER
+    d) According to the report from deviceQuery there are 3072 CUDA Cores
+3) Implement a task serial version:
+    b)
+    c)
+    g)
+    h)
+    i)
+    j)
+4) Implement a bulk synchronous version:
+    

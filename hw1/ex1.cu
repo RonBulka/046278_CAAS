@@ -1,6 +1,18 @@
 #include "ex1.h"
 
 __device__ void prefix_sum(int arr[], int arr_size) {
+    int tid = threadIdx.x;
+    int increment;
+    for (int stride = 1; stride < blockDim.x; stride *= 2){
+        if (tid >= stride){
+            increment = arr[tid - stride];
+        }
+        __syncthreads();
+        if (tid >= stride) {
+            arr[tid] += increment;
+        }
+        __syncthreads();
+    }
     return; // TODO
 }
 
@@ -17,6 +29,20 @@ void interpolate_device(uchar* maps ,uchar *in_img, uchar* out_img);
 
 __global__ void process_image_kernel(uchar *all_in, uchar *all_out, uchar *maps) {
     // TODO
+    int tile_col = threadIdx.x;
+    int tile_row = threadIdx.y;
+    int histogram[256] = { 0 };
+    int left = TILE_WIDTH*tile_col;
+    int right = TILE_WIDTH*(tile_col+1) - 1;
+    int top = TILE_WIDTH*tile_row;
+    int bottom = TILE_WIDTH*(tile_row+1) - 1;
+
+    for (int y=top; y<=bottom; y++) {
+        for (int x=left; x<=right; x++) {
+            uchar* row = all_in + y*IMG_WIDTH;
+            histogram[row[x]]++;
+        }
+    }
     interpolate_device(maps, all_in, all_out);
     return; 
 }
@@ -24,6 +50,9 @@ __global__ void process_image_kernel(uchar *all_in, uchar *all_out, uchar *maps)
 /* Task serial context struct with necessary CPU / GPU pointers to process a single image */
 struct task_serial_context {
     // TODO define task serial memory buffers
+    // task_serial_context needs to hold the pointer to the in_img and out_img
+    // we have TILES_COUNT*TILES_COUNT tiles
+    
 };
 
 /* Allocate GPU memory for a single input image and a single output image.

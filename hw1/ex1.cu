@@ -13,7 +13,7 @@ __device__ void prefix_sum(int arr[], int arr_size) {
         }
         __syncthreads();
     }
-    return; // TODO
+    return; // TODO: add support for not enough threads
 }
 
 /**
@@ -29,11 +29,12 @@ void interpolate_device(uchar* maps ,uchar *in_img, uchar* out_img);
 
 __global__ void process_image_kernel(uchar *all_in, uchar *all_out, uchar *maps) {
     // TODO
-    // one thread for each tile
-    int block_idx = blockDim.x;
+    // one thread for each tile // maybe add more threads to each tile so that we can do the hist and use prefix sum
+    int block_idx = blockIdx.x;
     int tile_col = threadIdx.x;
     int tile_row = threadIdx.y;
         // make it so it would work with less than TILES_COUNT*TILES_COUNT threads for an image
+        // use blockDim to see what is missing, page 15 in tutorial 3-4
         unsigned int histogram[256] = { 0 };
         int left = TILE_WIDTH*tile_col;
         int right = TILE_WIDTH*(tile_col+1) - 1;

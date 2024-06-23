@@ -4,9 +4,15 @@
 
 __device__ void prefix_sum(int arr[], int arr_size) {
     int tid = threadIdx.x;
+    if (tid > arr_size - 1) return;
     int increment;
+    int multiply = arr_size / blockDim.x;
+    multiply = ((multiply - 1) < 0) ? 0 : (multiply - 1);
     for (int stride = 1; stride < arr_size; stride *= 2) {
-        for (int i = tid; i < arr_size; i += blockDim.x) {
+        for (int i = (tid + multiply * blockDim.x); i >= 0; i -= blockDim.x) {
+            if (i > arr_size - 1) {
+                continue;
+            }
             if (i >= stride) {
                 increment = arr[i - stride];
             }
@@ -48,6 +54,16 @@ __global__ void process_image_kernel(uchar *all_in, uchar *all_out, uchar *maps)
             }
             __syncthreads();
 
+            // Debug print for shared memory initialization
+            // if (tid == 0) {
+            //     printf("Shared Histogram Initialized:\n");
+            //     for (int i = 0; i < 256; i++) {
+            //         printf("%d: %d\t", i, sharedHistogram[i]);
+            //     }
+            //     printf("\n");
+            // }
+            // __syncthreads();
+
             // Fill histogram
             for (int i = tid; i < TILE_WIDTH * TILE_WIDTH; i += blockDim.x) {
                 int tile_col = i % TILE_WIDTH;
@@ -59,9 +75,29 @@ __global__ void process_image_kernel(uchar *all_in, uchar *all_out, uchar *maps)
             }
             __syncthreads(); // Ensure all atomic adds are done
 
+            // Debug print for histogram values
+            // if (tid == 0) {
+            //     printf("Shared Histogram Filled:\n");
+            //     for (int i = 0; i < 256; i++) {
+            //         printf("%d: %d\t", i, sharedHistogram[i]);
+            //     }
+            //     printf("\n");
+            // }
+            // __syncthreads();
+
             // Prefix sum on sharedHistogram
             prefix_sum(sharedHistogram, 256);
             __syncthreads(); // Ensure prefix sum is completed
+
+            // Debug print for prefix sum values
+            // if (tid == 0) {
+            //     printf("Shared Histogram After Prefix Sum:\n");
+            //     for (int i = 0; i < 256; i++) {
+            //         printf("%d: %d\t", i, sharedHistogram[i]);
+            //     }
+            //     printf("\n");
+            // }
+            // __syncthreads();
 
             // Get correct maps entry
             uchar* map = &curr_maps[row_tile_n * TILE_COUNT * 256 + col_tile_n * 256];

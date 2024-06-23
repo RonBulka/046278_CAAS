@@ -1,16 +1,17 @@
 #include "ex1.h"
 
+#define THREADS_NUM TILE_WIDTH*4
+
 __device__ void prefix_sum(int arr[], int arr_size) {
     int tid = threadIdx.x;
     int increment;
-    for (int stride = 1; stride < arr_size; stride *= 2){
-        for (int i = tid; i < arr_size; i += blockDim.x){
-            if (i >= stride){
+    for (int stride = 1; stride < arr_size; stride *= 2) {
+        for (int i = tid; i < arr_size; i += blockDim.x) {
+            if (i >= stride) {
                 increment = arr[i - stride];
             }
             __syncthreads();
             if (i >= stride) {
-                // atomicAdd(&arr[i], increment);
                 arr[i] += increment;
             }
             __syncthreads();
@@ -32,52 +33,48 @@ __device__
 void interpolate_device(uchar* maps ,uchar *in_img, uchar* out_img);
 
 __global__ void process_image_kernel(uchar *all_in, uchar *all_out, uchar *maps) {
-    // TILE_WIDTH*TILE_COUNT threads per block, each one for a single pixel in a tile
     int tid = threadIdx.x;
     int block_idx = blockIdx.x;
     __shared__ int sharedHistogram[256];
-    uchar* curr_in = all_in + block_idx*IMG_HEIGHT*IMG_WIDTH;
-    uchar* curr_out = all_out + block_idx*IMG_HEIGHT*IMG_WIDTH;
-    uchar* curr_maps = &maps[block_idx*TILE_COUNT*TILE_COUNT*256];
+    uchar* curr_in = all_in + block_idx * IMG_HEIGHT * IMG_WIDTH;
+    uchar* curr_out = all_out + block_idx * IMG_HEIGHT * IMG_WIDTH;
+    uchar* curr_maps = &maps[block_idx * TILE_COUNT * TILE_COUNT * 256];
+
     for (int row_tile_n = 0; row_tile_n < TILE_COUNT; row_tile_n++) {
-        for (int col_tile_n = 0; col_tile_n < TILE_COUNT; col_tile_n++){
-            // init sharedHistogram/reset everything to zero
-            for(int k = tid; k < 256; k += blockDim.x){
+        for (int col_tile_n = 0; col_tile_n < TILE_COUNT; col_tile_n++) {
+            // Initialize sharedHistogram/reset everything to zero
+            for (int k = tid; k < 256; k += blockDim.x) {
                 sharedHistogram[k] = 0;
             }
             __syncthreads();
-            for (int i = tid; i < TILE_WIDTH*TILE_WIDTH; i+=blockDim.x){
+
+            // Fill histogram
+            for (int i = tid; i < TILE_WIDTH * TILE_WIDTH; i += blockDim.x) {
                 int tile_col = i % TILE_WIDTH;
                 int tile_row = i / TILE_WIDTH;
-                int y = TILE_WIDTH*row_tile_n + tile_row;
-                int x = TILE_WIDTH*col_tile_n + tile_col;
-                uchar* row = curr_in + y*IMG_WIDTH;
+                int y = TILE_WIDTH * row_tile_n + tile_row;
+                int x = TILE_WIDTH * col_tile_n + tile_col;
+                uchar* row = curr_in + y * IMG_WIDTH;
                 atomicAdd(&sharedHistogram[row[x]], 1);
             }
-            __syncthreads(); // ensure all atomic adds are done
-            // prefix_sum on sharedHistogram
+            __syncthreads(); // Ensure all atomic adds are done
+
+            // Prefix sum on sharedHistogram
             prefix_sum(sharedHistogram, 256);
-            __syncthreads(); // ensure prefix sum is completed
-            // if(tid == 0){
-            //     printf("after prefix_sum:\n");
-            //     for (int i = 0; i < 256; i++){
-            //         printf("%d: %d  ", i, sharedHistogram[i]);
-            //     }
-            //         printf("\n");
-            // }
-            // __syncthreads();
-            // get correct maps entry
-            uchar* map = &curr_maps[row_tile_n*TILE_COUNT*256 + col_tile_n*256];
-            // create new map values
-            for(int k = tid; k < 256; k += blockDim.x){
-                map[k] = (float(sharedHistogram[k]) * 255) / (TILE_WIDTH*TILE_WIDTH);
+            __syncthreads(); // Ensure prefix sum is completed
+
+            // Get correct maps entry
+            uchar* map = &curr_maps[row_tile_n * TILE_COUNT * 256 + col_tile_n * 256];
+            // Create new map values
+            for (int k = tid; k < 256; k += blockDim.x) {
+                map[k] = (float(sharedHistogram[k]) * 255) / (TILE_WIDTH * TILE_WIDTH);
             }
             __syncthreads();
         }
     }
-    if (tid == 0){
-        interpolate_device(curr_maps, curr_in, curr_out);
-    }
+
+    __syncthreads();
+    interpolate_device(curr_maps, curr_in, curr_out);
     return;
 }
 
@@ -114,7 +111,8 @@ void task_serial_process(struct task_serial_context *context, uchar *images_in,
     uchar* d_maps = context->maps;
     uchar* d_in_image = context->in_image;
     uchar* d_out_image = context->out_image;
-    int threads_num = min(1024, TILE_WIDTH*TILE_WIDTH);
+    int threads_num = min(1024, THREADS_NUM);
+    printf("number of threads in serial: %d\n", threads_num);
     dim3 threads_in_block(threads_num), blocks(1);
     for (int i = 0; i < N_IMAGES; i++){
         //   1. copy the relevant image from images_in to the GPU memory you allocated
@@ -176,7 +174,7 @@ void gpu_bulk_process(struct gpu_bulk_context *context, uchar *images_in, uchar 
                 N_IMAGES*IMG_HEIGHT*IMG_WIDTH*sizeof(uchar), cudaMemcpyHostToDevice) );
 
     //TODO: invoke a kernel with N_IMAGES threadblocks, each working on a different image  
-    int threads_num = min(1024, TILE_WIDTH*TILE_WIDTH);  
+    int threads_num = min(1024, THREADS_NUM);  
     dim3 threads_in_block(threads_num), blocks(N_IMAGES);
     process_image_kernel<<<blocks, threads_in_block>>>(context->all_in_images,
                                                         context->all_out_images,

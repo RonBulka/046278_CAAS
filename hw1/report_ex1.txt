@@ -9,10 +9,10 @@
     b) The GPU name on the server is NVIDIA GeForce RTX 2080 SUPER
     d) According to the report from deviceQuery there are 3072 CUDA Cores
 3) Implement a task serial version:
-    b)
-    c)
-    g)
-    h)
+    b) atomicAdd is required because in the program we go over the same tile with a bunch of threads which update the values in the histogram based on the image, meaning that there could be 2 threads that want to update the same space at the same time, meaning we need to put a lock in place or execute the operation in an atomic way
+    c) the number of threads is k*TILE_WIDTH where TILE_WIDTH is an exponent of 2 and is 64 or larger, meaning the TILE_WIDTH contain a multipul of 32 elements. And in our program we access the tile values row by row, meaning each warp reads 32 bytes that are aligned when we read from the image. The same principle is true for when we access the maps array, for each tile we access 256 elements that are aligned and we each warp gets its own 32 aligned elements reading 128 bytes
+    g) I chose to run 256 threads when invoking the kernel because a lot of the tasks we do in the kernel is operating on 256 arrays where its usually just a small calculation so if we had more than 256 threads the extra ones would be idle most of the kernel
+    h) 
     i)
     j)
 4) Implement a bulk synchronous version:

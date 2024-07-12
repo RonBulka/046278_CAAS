@@ -1,6 +1,6 @@
 #include "ex1.h"
 
-#define THREADS_NUM TILE_WIDTH*6
+#define THREADS_NUM TILE_WIDTH*4
 #define COMMON_SIZE 256
 
 __device__ void prefix_sum(int arr[], int arr_size) {
@@ -147,7 +147,7 @@ void task_serial_process(struct task_serial_context *context, uchar *images_in,
     uchar* d_out_image = context->out_image;
     int threads_num = min(1024, THREADS_NUM);
     int sharedMemSize = sizeof(int) * COMMON_SIZE;
-    printf("number of threads in serial: %d\n", threads_num);
+    // printf("number of threads in serial: %d\n", threads_num);
     dim3 threads_in_block(threads_num), blocks(1);
     for (int i = 0; i < N_IMAGES; i++){
         //   1. copy the relevant image from images_in to the GPU memory you allocated

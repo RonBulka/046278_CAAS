@@ -1,13 +1,10 @@
 #include "ex2.h"
 #include <cuda/atomic>
 
-#define THREADS_NUM TILE_WIDTH*4
 #define STREAM_THREADS 1024
 #define COMMON_SIZE 256
-#define MAX_SHARED_MEM_BLK 49152
-#define MAX_REGS_BLK 65536
-#define MAX_THREADS_BLK 1024
-#define MAX_BLOCKS_PER_SM 16
+#define INTERPOLATE_MEM 1024
+#define REGS_PER_THREAD 32
 
 __device__ void prefix_sum(int arr[], int arr_size) {
     // TODO complete according to hw1
@@ -214,20 +211,147 @@ std::unique_ptr<image_processing_server> create_streams_server()
     return std::make_unique<streams_server>();
 }
 
-// TODO implement a lock
+// TODO implement a Test and Test and Set lock
+class TATASLock
+{
+private:
+    // TODO define lock context
+    cuda::atomic<int, cuda::thread_scope_device> gpu_lock_state;
+    std::atomic<int> cpu_lock_state;
+
+public:
+    __host__ __device__ TATASLock() : gpu_lock_state(0), cpu_lock_state(0) {}
+
+    // GPU lock
+    __device__ void gpu_lock() {
+        while (true) {
+            // First check if the lock appears to be free
+            if (gpu_lock_state.load(cuda::memory_order_acquire) == 0) {
+                // Attempt to acquire the lock
+                if (gpu_lock_state.exchange(1, cuda::memory_order_acquire) == 0) {
+                    return; // Successfully acquired the lock
+                }
+            }
+            // Spin-wait (busy-wait) until the lock is free
+        }
+    }
+
+    // GPU unlock
+    __device__ void gpu_unlock() {
+        gpu_lock_state.store(0, cuda::memory_order_release);
+    }
+
+    // CPU lock
+    void cpu_lock() {
+        while (true) {
+            // First check if the lock appears to be free
+            if (cpu_lock_state.load(std::memory_order_acquire) == 0) {
+                // Attempt to acquire the lock
+                if (cpu_lock_state.exchange(1, std::memory_order_acquire) == 0) {
+                    return; // Successfully acquired the lock
+                }
+            }
+            // Spin-wait (busy-wait) until the lock is free
+        }
+    }
+
+    // CPU unlock
+    void cpu_unlock() {
+        cpu_lock_state.store(0, std::memory_order_release);
+    }
+};
+
 // TODO implement a MPMC queue
+template <typename T, uint8_t size> 
+class MPMCqueue
+{
+private:
+    static const size_t N = 1 << size;
+    T queue[N];
+    cuda::atomic<size_t> _head = 0, _tail = 0;
+public:
+    __host__ __device__ void push(const T &data) {
+        int tail = _tail.load(cuda::memory_order_relaxed);
+        while (tail - _head.load(cuda::memory_order_acquire) == N)
+            ;
+        queue[_tail % N] = data;
+        _tail.store(tail + 1, cuda::memory_order_release);
+    }
+
+    __host__ __device__ T pop() {
+        int head = _head.load(cuda::memory_order_relaxed);
+        while (_tail.load(cuda::memory_order_acquire) == _head)
+            ;
+        T item = queue[_head % N];
+        _head.store(head + 1, cuda::memory_order_release);
+    return item;
+    }
+};
+
+// element of data structure
+class data_element
+{
+public:
+    int img_id;
+    uchar *img_in;
+    uchar *img_out;
+};
+
 // TODO implement the persistent kernel
+__global__
+void persistent_kernel(){
+
+}
+
 // TODO implement a function for calculating the threadblocks count
+int calculate_threadblocks_count(int threads) {
+    // set device
+    int device;
+    cudaDeviceProp deviceProp;
+    CUDA_CHECK( cudaGetDevice(&device) );
+    CUDA_CHECK( cudaGetDeviceProperties(&deviceProp, device) );
+    // get device properties
+    int SM_count = deviceProp.multiProcessorCount;
+    int max_threads_per_SM = deviceProp.maxThreadsPerMultiProcessor;
+    int max_blocks_per_SM = deviceProp.maxBlocksPerMultiProcessor;
+    int max_shared_mem_per_SM = deviceProp.sharedMemPerMultiprocessor;
+    int max_regs_per_SM = deviceProp.regsPerMultiprocessor;
+    // kernel properties
+    int threads_per_block = threads;
+    int shared_mem_per_block = INTERPOLATE_MEM;
+    int regs_per_thread = REGS_PER_THREAD;
+    // calculate threadblocks count
+    // init with max possible threadblocks count
+    int threadblocks = max_blocks_per_SM;
+    // check threads constraint per SM
+    threadblocks = min(threadblocks, (max_threads_per_SM / threads_per_block));
+    // check shared memory constraint per SM
+    threadblocks = min(threadblocks, (max_shared_mem_per_SM / shared_mem_per_block));
+    // check register constraint per SM
+    threadblocks = min(threadblocks, (max_regs_per_SM / (threads_per_block * regs_per_thread)));
+    // return threadblocks count per all SMs
+    return threadblocks * SM_count;
+}
 
 class queue_server : public image_processing_server
 {
 private:
     // TODO define queue server context (memory buffers, etc...)
+    int thread_blocks;
+    int max_queue_size;
+    // queue for tasks
+
+    // queue for results
 public:
     queue_server(int threads)
     {
         // TODO initialize host state
         // TODO launch GPU persistent kernel with given number of threads, and calculated number of threadblocks
+        this->thread_blocks = calculate_threadblocks_count(threads);
+        this->max_queue_size = 16 * this->thread_blocks;
+        // init a queue for tasks and a queue for results
+
+        
     }
 
     ~queue_server() override

@@ -5,4 +5,9 @@ Submitter ID: 323118885
     c) table of runs going from maxLoad/2 to 2*maxLoad in 10 equal steps, writing down the load, latency and throughput for each run.
     d) graph of latency-throughput from the samples we collected in sub section c.
 2) Producer-Consumer Queues:
-    a)
+    a) To calculate the number of thread blocks we can have we firsly get the relavent information about the device (How many SMs, max threads per SM, max blocks per SM, max shared mem per SM, max regs per SM). Then we calculate the properties of the kernel we gonna run (threads per block, shared memory per block, number of registers per thread). After that we go through a list of constraints, we init the threadblock count per SM to be the max number of blocks per SM, after that we take the minimum between that and 3 other values:
+        i.      max threads per SM divided by the number of threads per block
+        ii.     max shared memory per SM divided by the shared memory each block takes
+        iii.    max registers per SM divided by the number of register per block
+       after that we return the threadblock count per SM times the SM count in the gpu.
+    b) implemant the queue

@@ -36,7 +36,7 @@ int calculate_upper_log2(int n) {
 __device__ void prefix_sum(int arr[], int arr_size) {
     // TODO complete according to hw1
     int tid = threadIdx.x;
-    int num_threads = blockDim.x;
+    // int num_threads = blockDim.x;
     // extern __shared__ int temp[];
     int increase;
     for (int stride = 1; stride < arr_size; stride *= 2) {
@@ -164,66 +164,60 @@ private:
     int image_id[STREAM_COUNT];
 
 public:
-    streams_server()
-    {
+    streams_server() {
         // TODO initialize context (memory buffers, streams, etc...)
-        for (int i = 0; i < STREAM_COUNT; i++)
-        {
+        for (int i = 0; i < STREAM_COUNT; i++) {
             CUDA_CHECK(cudaStreamCreate(&streams[i]));
+            image_id[i] = -1;
         }
         CUDA_CHECK(cudaHostAlloc(&maps, sizeof(uchar) * STREAM_COUNT * TILE_COUNT * TILE_COUNT * COMMON_SIZE, 0));
-        CUDA_CHECK(cudaHostAlloc(&in_image, sizeof(uchar) * STREAM_COUNT * IMG_HEIGHT * IMG_WIDTH, 0));
-        CUDA_CHECK(cudaHostAlloc(&out_image, sizeof(uchar) * STREAM_COUNT * IMG_HEIGHT * IMG_WIDTH, 0));
+        // CUDA_CHECK(cudaHostAlloc(&in_image, sizeof(uchar) * STREAM_COUNT * IMG_HEIGHT * IMG_WIDTH, 0));
+        // CUDA_CHECK(cudaHostAlloc(&out_image, sizeof(uchar) * STREAM_COUNT * IMG_HEIGHT * IMG_WIDTH, 0));
     }
 
-    ~streams_server() override
-    {
+    ~streams_server() override {
         // TODO free resources allocated in constructor
-        for (int i = 0; i < STREAM_COUNT; i++)
-        {
+        for (int i = 0; i < STREAM_COUNT; i++) {
             CUDA_CHECK(cudaStreamDestroy(streams[i]));
         }
         CUDA_CHECK(cudaFreeHost(maps));
-        CUDA_CHECK(cudaFreeHost(in_image));
-        CUDA_CHECK(cudaFreeHost(out_image));
+        // CUDA_CHECK(cudaFreeHost(in_image));
+        // CUDA_CHECK(cudaFreeHost(out_image));
     }
 
-    bool enqueue(int img_id, uchar *img_in, uchar *img_out) override
-    {
+    bool enqueue(int img_id, uchar *img_in, uchar *img_out) override {
         // TODO place memory transfers and kernel invocation in streams if possible.
-        for (int i = 0; i < STREAM_COUNT; i++)
-        {
-            if (image_id[i] == -1)
-            {
+        for (int i = 0; i < STREAM_COUNT; i++) {
+            if (image_id[i] == -1) {
                 image_id[i] = img_id;
                 uchar* maps_d = this->maps + i * TILE_COUNT * TILE_COUNT * COMMON_SIZE;
-                uchar* in_img_d = this->in_image + i * IMG_HEIGHT * IMG_WIDTH;
-                uchar* out_img_d = this->out_image + i * IMG_HEIGHT * IMG_WIDTH;
-                CUDA_CHECK(cudaMemcpyAsync(in_img_d, img_in, sizeof(uchar) * IMG_HEIGHT * IMG_WIDTH, 
-                                            cudaMemcpyHostToDevice, streams[i]));
-                process_image_kernel<<<1, STREAM_THREADS, 0, streams[i]>>>( in_img_d,
-                                                                            out_img_d,
+                // uchar* in_img_d = this->in_image + i * IMG_HEIGHT * IMG_WIDTH;
+                // uchar* out_img_d = this->out_image + i * IMG_HEIGHT * IMG_WIDTH;
+                // CUDA_CHECK(cudaMemcpyAsync(in_img_d, img_in, sizeof(uchar) * IMG_HEIGHT * IMG_WIDTH, 
+                //                             cudaMemcpyHostToDevice, streams[i]));
+                process_image_kernel<<<1, STREAM_THREADS, 0, streams[i]>>>( img_in,
+                                                                            img_out,
                                                                             maps_d);
-                CUDA_CHECK(cudaMemcpyAsync(img_out, out_img_d, sizeof(uchar) * IMG_HEIGHT * IMG_WIDTH, 
-                                            cudaMemcpyDeviceToHost, streams[i]));
+                // CUDA_CHECK(cudaMemcpyAsync(img_out, out_img_d, sizeof(uchar) * IMG_HEIGHT * IMG_WIDTH, 
+                //                             cudaMemcpyDeviceToHost, streams[i]));
                 return true;
             }
         }
         return false;
     }
 
-    bool dequeue(int *img_id) override
-    {
-        return false;
-
+    bool dequeue(int *img_id) override {
         // TODO query (don't block) streams for any completed requests.
-        for (int i = 0; i < STREAM_COUNT; i++)
-        {
+        for (int i = 0; i < STREAM_COUNT; i++) {
             cudaError_t status = cudaStreamQuery(streams[i]); // TODO query diffrent stream each iteration
             switch (status) {
             case cudaSuccess:
                 // TODO return the img_id of the request that was completed.
+                if (image_id[i] == -1) {
+                    continue;
+                }
                 *img_id = image_id[i];
+                // printf("Image %d is ready\n", *img_id);
                 image_id[i] = -1;
                 return true;
             case cudaErrorNotReady:
@@ -233,6 +227,7 @@ public:
                 return false;
             }
         }
+        return false;
     }
 };
 
@@ -273,8 +268,6 @@ public:
     }
 };
 
-
-
 // TODO change things up to work (mainly head and tail stuff)
 template <typename T>
 class MPMCqueue
@@ -282,25 +275,30 @@ class MPMCqueue
 private:
     size_t max_size;
     T* queue;
-    cuda::atomic<size_t> _head = 0, _tail = 0, _size = 0;
+    cuda::atomic<size_t> _head, _tail, _size;
     TATASLock lock;
 
 public:
-    __host__ __device__ MPMCqueue() : max_size(0) {
-        this->queue = NULL;
+    __host__ MPMCqueue() : max_size(0), queue(nullptr) {
+        _head.store(0, cuda::memory_order_relaxed);
+        _tail.store(0, cuda::memory_order_relaxed);
+        _size.store(0, cuda::memory_order_relaxed);
     }
 
-    __host__ __device__ MPMCqueue(size_t N) : max_size(N) {
+    __host__ MPMCqueue(size_t N) : max_size(N) {
         CUDA_CHECK(cudaMallocHost(&(this->queue), sizeof(T) * this->max_size, 0));
+        _head.store(0, cuda::memory_order_relaxed);
+        _tail.store(0, cuda::memory_order_relaxed);
+        _size.store(0, cuda::memory_order_relaxed);
     }
 
-    __host__ __device__ ~MPMCqueue() {
-        if (this->queue != NULL) {
+    __host__ ~MPMCqueue() {
+        if (this->queue != nullptr) {
             CUDA_CHECK(cudaFreeHost(this->queue));
         }
     }
 
-    __host__ __device__ void init_queue(size_t N) {
+    __host__ void init_queue(size_t N) {
         this->max_size = N;
         CUDA_CHECK(cudaMallocHost(&(this->queue), sizeof(T) * this->max_size, 0));
     }
@@ -309,6 +307,7 @@ public:
         lock.lock();
         if (_size.load(cuda::memory_order_acquire) == max_size) {
             // Queue is full
+            _size.store(max_size, cuda::memory_order_release);
             lock.unlock();
             return false;
         }
@@ -324,6 +323,7 @@ public:
         lock.lock();
         if (_size.load(cuda::memory_order_acquire) == 0) {
             // Queue is empty
+            _size.store(0, cuda::memory_order_release);
             lock.unlock();
             return false;
         }
@@ -345,6 +345,7 @@ public:
     __host__ bool cpu_push(const T item) {
         if (_size.load(cuda::memory_order_acquire) == max_size) {
             // Queue is full
+            _size.store(max_size, cuda::memory_order_release);
             return false;
         }
         int tail = _tail.load(cuda::memory_order_relaxed);
@@ -357,6 +358,7 @@ public:
     __host__ bool cpu_pop(T *item) {
         if (_size.load(cuda::memory_order_acquire) == 0) {
             // Queue is empty
+            _size.store(0, cuda::memory_order_release);
             return false;
         }
         int head = _head.load(cuda::memory_order_relaxed);
@@ -375,22 +377,7 @@ public:
     }
 };
 
-// TODO implement the persistent kernel
-__global__
-void persistent_kernel(queue_server *server) {
-    // TODO implement the persistent kernel
-    data_element task;
-    uchar* block_maps = server->get_maps() + blockIdx.x * TILE_COUNT * TILE_COUNT * COMMON_SIZE;
-    while (true) {
-        if (server->is_empty_tasks() && server->stop()) {
-            break;
-        }
-        server->gpu_dequeue(&task);
-        process_image_kernel(task.img_in, task.img_out, block_maps);
-        server->gpu_enqueue(task.img_id);
-    }
 
-}
 
 // TODO implement a function for calculating the threadblocks count
 int calculate_threadblocks_count(int threads) {
@@ -407,7 +394,7 @@ int calculate_threadblocks_count(int threads) {
     int max_regs_per_SM = deviceProp.regsPerMultiprocessor;
     // kernel properties
     int threads_per_block = threads;
-    int shared_mem_per_block = INTERPOLATE_MEM + 4 * COMMON_SIZE;
+    int shared_mem_per_block = INTERPOLATE_MEM + sizeof(int) * COMMON_SIZE;
     int regs_per_thread = REGS_PER_THREAD;
     // calculate threadblocks count
     // init with max possible threadblocks count
@@ -448,12 +435,13 @@ public:
         this->max_queue_size = 1 << calculate_upper_log2(this->thread_blocks << 4);
         // init a queue for tasks and a queue for results
         CUDA_CHECK( cudaMallocHost(&pinned_queue_tasks, sizeof(MPMCqueue<data_element>), 0) );
-        this->tasks = new (pinned_queue_tasks)MPMCqueue<data_element>;
+        this->tasks = new (pinned_queue_tasks) MPMCqueue<data_element>;
         this->tasks->init_queue(this->max_queue_size);
 
         CUDA_CHECK( cudaMallocHost(&pinned_queue_results, sizeof(MPMCqueue<int>)) );
-        this->results = new (pinned_queue_results)MPMCqueue<int>;
+        this->results = new (pinned_queue_results) MPMCqueue<int>;
         this->results->init_queue(this->max_queue_size);
+
         CUDA_CHECK( cudaMallocHost(&taskmaps, sizeof(uchar) * this->thread_blocks * TILE_COUNT * TILE_COUNT * COMMON_SIZE, 0) );
         // TODO launch GPU persistent kernel with given number of threads, and calculated number of threadblocks
         persistent_kernel<<<this->thread_blocks, threads>>>(this);
@@ -478,7 +466,7 @@ public:
         CUDA_CHECK( cudaFreeHost(this->taskmaps) );
     }
 
-    uchar* get_maps() {
+    __device__ uchar* get_maps() {
         return this->taskmaps;
     }
 
@@ -494,9 +482,9 @@ public:
         return true;
     }
 
-    __device__ void gpu_enqueue(int img_id) {
+    __device__ bool gpu_enqueue(int img_id) {
         // TODO push result into results queue
-        this->results->gpu_push(img_id);
+        return this->results->gpu_push(img_id);
     }
 
     // cpu pops result from results queue
@@ -512,9 +500,8 @@ public:
     }
 
     // gpu pops task from queue
-    __device__ void gpu_dequeue(data_element* task) {
-        // TODO pop task from queue
-        this->tasks->gpu_pop(task);
+    __device__ bool gpu_dequeue(data_element* task) {
+        return this->tasks->gpu_pop(task);
     }
 
     __device__ bool stop() {
@@ -525,6 +512,40 @@ public:
         return this->tasks->is_empty_gpu();
     }
 };
+
+// TODO implement the persistent kernel
+__global__
+void persistent_kernel(queue_server *server) {
+    __shared__ bool flag;
+    data_element task;
+    uchar* block_maps = server->get_maps() + blockIdx.x * TILE_COUNT * TILE_COUNT * COMMON_SIZE;
+    while (true) {
+        if (threadIdx.x == 0) {
+            flag = false;
+            if (server->is_empty_tasks() && server->stop()) {
+                flag = true;
+            }
+        }
+        __syncthreads();
+        if (flag) {
+            break;
+        }
+        if (threadIdx.x == 0) {
+            if (!server->gpu_dequeue(&task)) {
+                flag = true;
+            }
+        }
+        __syncthreads();
+        if (flag) {
+            continue;
+        }
+        process_image(task.img_in, task.img_out, block_maps);
+        if (threadIdx.x == 0) {
+            while (!server->gpu_enqueue(task.img_id));
+        }
+        __syncthreads();
+    }
+}
 
 std::unique_ptr<image_processing_server> create_queues_server(int threads)
 {

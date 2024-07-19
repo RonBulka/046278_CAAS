@@ -1,7 +1,7 @@
 Submitter ID: 323118885
 1) CUDA Streams:
     a) done.
-    b) maxLoad = 
+    b) maxLoad = 428.8 (req/sec)
     c) table of runs going from maxLoad/2 to 2*maxLoad in 10 equal steps, writing down the load, latency and throughput for each run.
     d) graph of latency-throughput from the samples we collected in sub section c.
 2) Producer-Consumer Queues:

@@ -270,40 +270,41 @@ public:
 
 
 // TODO change things up to work (mainly head and tail stuff)
-template <typename T> 
+template <typename T>
 class MPMCqueue
 {
 private:
     size_t size;
-    T queue[];
+    T* queue;
     cuda::atomic<size_t> _head = 0, _tail = 0;
     TATASLock lock;
+
 public:
     __host__ __device__ MPMCqueue() : size(0) {
-        queue = NULL;
+        this->queue = NULL;
     }
 
     __host__ __device__ MPMCqueue(size_t N) : size(N) {
-        CUDA_CHECK( cudaMallocHost(&(this->queue), sizeof(T) * this->size, 0) );
+        CUDA_CHECK(cudaMallocHost(&(this->queue), sizeof(T) * this->size, 0));
     }
 
     __host__ __device__ ~MPMCqueue() {
-        if (queue != NULL) {
-            CUDA_CHECK( cudaFreeHost(this->queue) );
+        if (this->queue != NULL) {
+            CUDA_CHECK(cudaFreeHost(this->queue));
         }
     }
 
     __host__ __device__ void init_queue(size_t N) {
-        size = N;
-        CUDA_CHECK( cudaMallocHost(&(this->queue), sizeof(T) * this->size, 0) );
+        this->size = N;
+        CUDA_CHECK(cudaMallocHost(&(this->queue), sizeof(T) * this->size, 0));
     }
 
     __device__ void gpu_push(const T &data) {
         lock.lock();
         int tail = _tail.load(cuda::memory_order_relaxed);
         while (tail - _head.load(cuda::memory_order_acquire) == size)
-            ;
-        queue[_tail % size] = data;
+            ; // Busy-wait until space is available
+        queue[tail % size] = data;
         _tail.store(tail + 1, cuda::memory_order_release);
         lock.unlock();
     }
@@ -312,14 +313,14 @@ public:
         lock.lock();
         int head = _head.load(cuda::memory_order_relaxed);
         while (_tail.load(cuda::memory_order_acquire) == _head)
-            ;
-        T item = queue[_head % size];
+            ; // Busy-wait until data is available
+        T item = queue[head % size];
         _head.store(head + 1, cuda::memory_order_release);
         lock.unlock();
-    return item;
+        return item;
     }
 
-    __device__ bool check_empty_gpu() {
+    __device__ bool is_empty_gpu() {
         lock.lock();
         bool status = _head.load(cuda::memory_order_relaxed) == _tail.load(cuda::memory_order_relaxed);
         lock.unlock();
@@ -329,27 +330,26 @@ public:
     __host__ void cpu_push(const T &data) {
         int tail = _tail.load(cuda::memory_order_relaxed);
         while (tail - _head.load(cuda::memory_order_acquire) == size)
-            ;
-        queue[_tail % size] = data;
+            ; // Busy-wait until space is available
+        queue[tail % size] = data;
         _tail.store(tail + 1, cuda::memory_order_release);
     }
 
     __host__ T cpu_pop() {
         int head = _head.load(cuda::memory_order_relaxed);
         while (_tail.load(cuda::memory_order_acquire) == _head)
-            ;
-        T item = queue[_head % size];
+            ; // Busy-wait until data is available
+        T item = queue[head % size];
         _head.store(head + 1, cuda::memory_order_release);
         return item;
     }
 
-    __host__ bool check_empty_cpu() {
-        return _head.load(cuda::memory_order_relaxed) == _tail.load(cuda::memory_order_relaxed);
+    __host__ bool is_empty_cpu() {
+        return (_head.load(cuda::memory_order_relaxed) == _tail.load(cuda::memory_order_relaxed));
     }
 
-    __host__ bool check_full_cpu() {
-        bool status = _tail.load(cuda::memory_order_relaxed) - _head.load(cuda::memory_order_acquire) == size;
-        return status;
+    __host__ bool is_full_cpu() {
+        return (_tail.load(cuda::memory_order_relaxed) - _head.load(cuda::memory_order_acquire) == size);
     }
 };
 
@@ -360,6 +360,9 @@ void persistent_kernel(queue_server *server) {
     data_element task;
     uchar* block_maps = server->get_maps() + blockIdx.x * TILE_COUNT * TILE_COUNT * COMMON_SIZE;
     while (true) {
+        if (server->is_empty_tasks() && server->stop()) {
+            break;
+        }
         server->gpu_dequeue(&task);
         process_image_kernel(task.img_in, task.img_out, block_maps);
         server->gpu_enqueue(task.img_id);
@@ -408,15 +411,14 @@ private:
     // queue for results - gpu pushes and cpu pops
     MPMCqueue<int>* results;
     // flag to stop the kernel
-    bool* stop_kernel;
+    cuda::atomic<bool> stop_kernel;
     // maps for interpolation
     uchar* taskmaps;
 public:
     queue_server(int threads)
     {
         // TODO initialize host state
-        CUDA_CHECK( cudaMallocHost(&stop_kernel, sizeof(bool), 0) );
-        *(this->stop_kernel) = false;
+        stop_kernel.store(false, cuda::memory_order_relaxed);
         this->thread_blocks = calculate_threadblocks_count(threads);
         // calculate max queue size - upper power of 2 of 16 * thread_blocks
         this->max_queue_size = 1 << calculate_upper_log2(this->thread_blocks << 4);
@@ -434,7 +436,8 @@ public:
     ~queue_server() override
     {
         // TODO free resources allocated in constructor
-        *(this->stop_kernel) = true;
+        // set stop flag
+        stop_kernel.store(true, cuda::memory_order_relaxed);
         // wait for kernel to finish
         cudaDeviceSynchronize();
         cudaError_t error = cudaGetLastError();
@@ -442,7 +445,6 @@ public:
             fprintf(stderr, "Kernel execution failed:%s\n", cudaGetErrorString(error));
             return;
         }
-        CUDA_CHECK( cudaFreeHost(this->stop_kernel) );
         delete this->tasks;
         delete this->results;
         CUDA_CHECK( cudaFreeHost(this->taskmaps) );
@@ -456,7 +458,7 @@ public:
     bool enqueue(int img_id, uchar *img_in, uchar *img_out) override
     {
         // TODO push new task into queue if possible
-        if (this->tasks->check_full_cpu()) {
+        if (this->tasks->is_full_cpu()) {
             return false;
         }
         data_element task = {img_id, img_in, img_out};
@@ -479,7 +481,7 @@ public:
     bool dequeue(int *img_id) override
     {
         // TODO query (don't block) the producer-consumer queue for any responses.
-        if (this->results->check_empty_cpu()) {
+        if (this->results->is_empty_cpu()) {
             return false;
         }
         // TODO return the img_id of the request that was completed.
@@ -488,7 +490,11 @@ public:
     }
 
     __device__ bool stop() {
-        return *(this->stop_kernel);
+        return this->stop_kernel.load(cuda::memory_order_relaxed);
+    }
+
+    __device__ bool is_empty_tasks() {
+        return this->tasks->is_empty_gpu();
     }
 };
 

@@ -82,6 +82,10 @@ void process_image(uchar *in, uchar *out, uchar* maps) {
     int tid = threadIdx.x;
     int block_size = blockDim.x;
     __shared__ int sharedHistogram[COMMON_SIZE];
+    if (tid == 0) {
+        printf("Thread block %d Processing image\n", blockIdx.x);
+    }
+    __syncthreads();
     // do one tile at a time
     for (int row_tile_n = 0; row_tile_n < TILE_COUNT; row_tile_n++) {
         for (int col_tile_n = 0; col_tile_n < TILE_COUNT; col_tile_n++) {
@@ -247,7 +251,7 @@ public:
                 // Attempt to acquire the lock
                 // printf("Trying to acquire lock\n");
                 if (gpu_lock_state.exchange(1, cuda::memory_order_acquire) == 0) {
-                    printf("Lock acquired\n");
+                    // printf("Lock acquired by thread block %d\n", blockIdx.x);
                     return; // Successfully acquired the lock
                 }
             }
@@ -258,7 +262,7 @@ public:
     // GPU unlock
     __device__ void unlock() {
         gpu_lock_state.store(0, cuda::memory_order_release);
-        printf("Lock released\n");
+        // printf("Lock released by thread block %d\n", blockIdx.x);
     }
 };
 
@@ -269,105 +273,123 @@ class MPMCqueue
 private:
     size_t max_size;
     T* queue;
-    cuda::atomic<size_t> _head, _tail, _size;
+    cuda::atomic<size_t> *_head, *_tail, *_size;
     TATASLock lock;
 
 public:
     __host__ MPMCqueue() : max_size(0), queue(nullptr) {
-        _head.store(0, cuda::memory_order_seq_cst);
-        _tail.store(0, cuda::memory_order_seq_cst);
-        _size.store(0, cuda::memory_order_seq_cst);
+        CUDA_CHECK( cudaHostAlloc(&this->_head, sizeof(cuda::atomic<size_t>), cudaHostAllocDefault) );
+        ::new(this->_head) cuda::atomic<size_t>(0);
+        CUDA_CHECK( cudaHostAlloc(&this->_tail, sizeof(cuda::atomic<size_t>), cudaHostAllocDefault) );
+        ::new(this->_tail) cuda::atomic<size_t>(0);
+        CUDA_CHECK( cudaHostAlloc(&this->_size, sizeof(cuda::atomic<size_t>), cudaHostAllocDefault) );
+        ::new(this->_size) cuda::atomic<size_t>(0);
+        // _head.store(0, cuda::memory_order_seq_cst);
+        // _tail.store(0, cuda::memory_order_seq_cst);
+        // _size.store(0, cuda::memory_order_seq_cst);
     }
 
     __host__ MPMCqueue(size_t N) : max_size(N) {
         CUDA_CHECK(cudaHostAlloc(&(this->queue), sizeof(T) * this->max_size, cudaHostAllocDefault));
-        _head.store(0, cuda::memory_order_seq_cst);
-        _tail.store(0, cuda::memory_order_seq_cst);
-        _size.store(0, cuda::memory_order_seq_cst);
+        CUDA_CHECK( cudaHostAlloc(&this->_head, sizeof(cuda::atomic<size_t>), cudaHostAllocDefault) );
+        ::new(this->_head) cuda::atomic<size_t>(0);
+        CUDA_CHECK( cudaHostAlloc(&this->_tail, sizeof(cuda::atomic<size_t>), cudaHostAllocDefault) );
+        ::new(this->_tail) cuda::atomic<size_t>(0);
+        CUDA_CHECK( cudaHostAlloc(&this->_size, sizeof(cuda::atomic<size_t>), cudaHostAllocDefault) );
+        ::new(this->_size) cuda::atomic<size_t>(0);
+        // _head.store(0, cuda::memory_order_seq_cst);
+        // _tail.store(0, cuda::memory_order_seq_cst);
+        // _size.store(0, cuda::memory_order_seq_cst);
     }
 
     __host__ ~MPMCqueue() {
         if (this->queue != nullptr) {
-            CUDA_CHECK(cudaFreeHost(this->queue));
+            CUDA_CHECK( cudaFreeHost(this->queue) );
         }
+        this->_head->~atomic<size_t>();
+        CUDA_CHECK( cudaFreeHost(this->_head) );
+        this->_tail->~atomic<size_t>();
+        CUDA_CHECK( cudaFreeHost(this->_tail) );
+        this->_size->~atomic<size_t>();
+        CUDA_CHECK( cudaFreeHost(this->_size) );
     }
 
     __host__ void init_queue(size_t N) {
         this->max_size = N;
-        CUDA_CHECK(cudaHostAlloc(&(this->queue), sizeof(T) * this->max_size, cudaHostAllocDefault));
+        CUDA_CHECK( cudaHostAlloc(&(this->queue), sizeof(T) * this->max_size, cudaHostAllocDefault) );
     }
 
     __device__ bool gpu_push(const T item) {
         lock.lock();
-        if (_size.load(cuda::memory_order_acquire) == max_size) {
+        if (_size->load(cuda::memory_order_acquire) == max_size) {
             // Queue is full
-            _size.store(max_size, cuda::memory_order_release);
+            _size->store(max_size, cuda::memory_order_release);
             lock.unlock();
             return false;
         }
-        int tail = _tail.load(cuda::memory_order_seq_cst);
+        int tail = _tail->load(cuda::memory_order_seq_cst);
         queue[tail % max_size] = item;
-        _tail.store((tail + 1) % max_size, cuda::memory_order_seq_cst);
-        _size.fetch_add(1, cuda::memory_order_release); // Increment size
+        _tail->store((tail + 1) % max_size, cuda::memory_order_seq_cst);
+        _size->fetch_add(1, cuda::memory_order_release); // Increment size
         lock.unlock();
         return true;
     }
 
     __device__ bool gpu_pop(T *item) {
         lock.lock();
-        if (_size.load(cuda::memory_order_acquire) == 0) {
+        if (_size->load(cuda::memory_order_acquire) == 0) {
             // Queue is empty
-            _size.store(0, cuda::memory_order_release);
+            _size->store(0, cuda::memory_order_release);
             lock.unlock();
             return false;
         }
-        int head = _head.load(cuda::memory_order_seq_cst);
+        int head = _head->load(cuda::memory_order_seq_cst);
         *item = queue[head % max_size];
-        _head.store((head + 1) % max_size, cuda::memory_order_seq_cst);
-        _size.fetch_sub(1, cuda::memory_order_release); // Decrement size
+        _head->store((head + 1) % max_size, cuda::memory_order_seq_cst);
+        _size->fetch_sub(1, cuda::memory_order_release); // Decrement size
         lock.unlock();
         return true;
     }
 
     __device__ bool is_empty_gpu() {
         lock.lock();
-        bool status = (_size.load(cuda::memory_order_seq_cst) == 0);
+        bool status = (_size->load(cuda::memory_order_seq_cst) == 0);
         lock.unlock();
         return status;
     }
 
     __host__ bool cpu_push(const T item) {
-        if (_size.load(cuda::memory_order_acquire) == max_size) {
+        if (_size->load(cuda::memory_order_acquire) == max_size) {
             // Queue is full
-            _size.store(max_size, cuda::memory_order_release);
+            _size->store(max_size, cuda::memory_order_release);
             return false;
         }
-        int tail = _tail.load(cuda::memory_order_seq_cst);
+        int tail = _tail->load(cuda::memory_order_seq_cst);
         queue[tail % max_size] = item;
-        _tail.store((tail + 1) % max_size, cuda::memory_order_seq_cst);
-        _size.fetch_add(1, cuda::memory_order_release); // Increment size
+        _tail->store((tail + 1) % max_size, cuda::memory_order_seq_cst);
+        _size->fetch_add(1, cuda::memory_order_release); // Increment size
         return true;
     }
 
     __host__ bool cpu_pop(T *item) {
-        if (_size.load(cuda::memory_order_acquire) == 0) {
+        if (_size->load(cuda::memory_order_acquire) == 0) {
             // Queue is empty
-            _size.store(0, cuda::memory_order_release);
+            _size->store(0, cuda::memory_order_release);
             return false;
         }
-        int head = _head.load(cuda::memory_order_seq_cst);
+        int head = _head->load(cuda::memory_order_seq_cst);
         *item = queue[head % max_size];
-        _head.store((head + 1) % max_size, cuda::memory_order_seq_cst);
-        _size.fetch_sub(1, cuda::memory_order_release); // Decrement size
+        _head->store((head + 1) % max_size, cuda::memory_order_seq_cst);
+        _size->fetch_sub(1, cuda::memory_order_release); // Decrement size
         return true;
     }
 
     __host__ bool is_empty_cpu() {
-        return (_size.load(cuda::memory_order_seq_cst) == 0);
+        return (_size->load(cuda::memory_order_seq_cst) == 0);
     }
 
     __host__ bool is_full_cpu() {
-        return (_size.load(cuda::memory_order_seq_cst) == max_size);
+        return (_size->load(cuda::memory_order_seq_cst) == max_size);
     }
 };
 
@@ -415,30 +437,27 @@ void persistent_kernel(uchar* maps, MPMCqueue<data_element>* tasks,
     uchar* block_maps = maps + blockIdx.x * TILE_COUNT * TILE_COUNT * COMMON_SIZE;
     while (true) {
         if (threadIdx.x == 0) {
-            printf("Thread block %d entered loop\n", blockIdx.x);
-            flag = false;
-            if (stop_kernel->load(cuda::memory_order_seq_cst) && tasks->is_empty_gpu()) {
-                printf("Thread block %d is done\n", blockIdx.x);
-                flag = true;
-            }
+            // printf("Thread block %d entered loop\n", blockIdx.x);
+            flag = (stop_kernel->load(cuda::memory_order_acquire) && tasks->is_empty_gpu());
         }
         __syncthreads();
         if (flag) {
             break;
         }
         if (threadIdx.x == 0) {
-            printf("Thread block %d is trying to dequeue\n", blockIdx.x);
-            if (!tasks->gpu_pop(&task)) {
-                flag = true;
-            }
+            flag = !tasks->gpu_pop(&task);
+            if (!flag) printf("Thread block %d dequeued image %d\n", blockIdx.x, task.img_id);
         }
         __syncthreads();
         if (flag) {
             continue;
         }
         process_image(task.img_in, task.img_out, block_maps);
+        __syncthreads();
         if (threadIdx.x == 0) {
+            printf("Thread block %d finished processing image %d\n", blockIdx.x, task.img_id);
             while (!results->gpu_push(task.img_id));
+            printf("Thread block %d finished image %d\n", blockIdx.x, task.img_id);
         }
         __syncthreads();
     }
@@ -457,14 +476,16 @@ private:
     uchar* pinned_queue_results;
     MPMCqueue<int>* results;
     // flag to stop the kernel
-    cuda::atomic<bool> stop_kernel;
+    cuda::atomic<bool>* stop_kernel;
     // maps for interpolation
     uchar* taskmaps;
 public:
     queue_server(int threads)
     {
         // TODO initialize host state
-        stop_kernel.store(false, cuda::memory_order_seq_cst);
+        CUDA_CHECK( cudaHostAlloc(&this->stop_kernel, sizeof(cuda::atomic<bool>), cudaHostAllocDefault) );
+        ::new(this->stop_kernel) cuda::atomic<bool>(false);
+        // stop_kernel->store(false, cuda::memory_order_release);
         this->thread_blocks = calculate_threadblocks_count(threads);
         printf("Thread blocks: %d\n", this->thread_blocks);
         // calculate max queue size - upper power of 2 of 16 * thread_blocks
@@ -483,14 +504,14 @@ public:
         // TODO launch GPU persistent kernel with given number of threads, and calculated number of threadblocks
         dim3 _threads(threads), blocks(this->thread_blocks);
         persistent_kernel<<<blocks, _threads>>>(this->taskmaps, this->tasks,
-                                                this->results, &this->stop_kernel);
+                                                this->results, this->stop_kernel);
     }
 
     ~queue_server() override
     {
         // TODO free resources allocated in constructor
         // set stop flag
-        stop_kernel.store(true, cuda::memory_order_seq_cst);
+        stop_kernel->store(true, cuda::memory_order_release);
         // wait for kernel to finish
         cudaDeviceSynchronize();
         cudaError_t error = cudaGetLastError();
@@ -498,6 +519,9 @@ public:
             fprintf(stderr, "Kernel execution failed:%s\n", cudaGetErrorString(error));
             return;
         }
+        // free resources
+        this->stop_kernel->~atomic<bool>();
+        CUDA_CHECK ( cudaFreeHost(this->stop_kernel) );
         delete this->tasks;
         CUDA_CHECK( cudaFreeHost(this->pinned_queue_tasks) );
         delete this->results;
@@ -516,9 +540,12 @@ public:
         if (this->tasks->is_full_cpu()) {
             return false;
         }
-        data_element task = {img_id, img_in, img_out};
+        data_element task = {};
+        task.img_id = img_id;
+        task.img_in = img_in;
+        task.img_out = img_out;
         this->tasks->cpu_push(task);
-        printf("Image %d is in queue\n", img_id);
+        printf("Image %d is in queue\n", task.img_id);
         return true;
     }
 
@@ -546,7 +573,7 @@ public:
     }
 
     __device__ bool stop() {
-        return this->stop_kernel.load(cuda::memory_order_seq_cst);
+        return this->stop_kernel->load(cuda::memory_order_acquire);
     }
 
     __device__ bool is_empty_tasks() {

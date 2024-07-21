@@ -278,28 +278,38 @@ private:
 public:
     __host__ MPMCqueue(size_t N) : max_size(N) {
         // Allocate memory for queue
-        CUDA_CHECK(cudaMallocManaged(&queue, N * sizeof(data_element)));
-        CUDA_CHECK(cudaMallocManaged(&_head, sizeof(cuda::atomic<size_t>)));
-        CUDA_CHECK(cudaMallocManaged(&_tail, sizeof(cuda::atomic<size_t>)));
-        lock = new TATASLock();
+        CUDA_CHECK( cudaHostAlloc(&(this->queue), sizeof(data_element) * this->max_size, cudaHostAllocDefault));
+        CUDA_CHECK( cudaHostAlloc(&this->_head, sizeof(cuda::atomic<size_t>), cudaHostAllocDefault) );
+        ::new(this->_head) cuda::atomic<size_t>(0);
+        CUDA_CHECK( cudaHostAlloc(&this->_tail, sizeof(cuda::atomic<size_t>), cudaHostAllocDefault) );
+        ::new(this->_tail) cuda::atomic<size_t>(0);
+        this->lock = new TATASLock();
 
-        *_head = 0;
-        *_tail = 0;
     }
 
     __host__ ~MPMCqueue() {
         // Free resources allocated in constructor
-        CUDA_CHECK(cudaFree(queue));
-        CUDA_CHECK(cudaFree(_head));
-        CUDA_CHECK(cudaFree(_tail));
-        delete lock;
+        if (this->queue != nullptr) {
+            CUDA_CHECK(cudaFreeHost(this->queue));
+        }
+        if (this->_head != nullptr) {
+            this->_head->~atomic<size_t>();
+            CUDA_CHECK(cudaFreeHost(this->_head));
+        }
+        if (this->_tail != nullptr) {
+            this->_tail->~atomic<size_t>();
+            CUDA_CHECK(cudaFreeHost(this->_tail));
+        }
+        if (this->lock != nullptr) {
+            this->lock->~TATASLock();
+            delete this->lock;
+        }
     }
 
     __device__ bool gpu_push(const data_element &item) {
         size_t tail = _tail->load(cuda::memory_order_relaxed);
-        if (tail - _head->load(cuda::memory_order_acquire) == max_size){
-            return false;
-        }
+        while (tail - _head->load(cuda::memory_order_acquire) == max_size)
+            ;
         queue[tail % max_size] = item;
         _tail->store(tail + 1, cuda::memory_order_release);
         printf("Thread block %d pushed image %d\n", blockIdx.x, item.img_id);
@@ -308,9 +318,8 @@ public:
 
     __device__ bool gpu_pop(data_element *item) {
         size_t head = _head->load(cuda::memory_order_relaxed);
-        if (_tail->load(cuda::memory_order_acquire) == head) {
-            return false;
-        }
+        while (_tail->load(cuda::memory_order_acquire) == head)
+            ;
         *item = queue[head % max_size];
         _head->store(head + 1, cuda::memory_order_release);
         printf("Thread block %d popped image %d with value of %d in last place\n", blockIdx.x, item->img_id, item->img_in[IMG_HEIGHT * IMG_WIDTH - 1]);
@@ -364,7 +373,7 @@ int calculate_threadblocks_count(int threads) {
 
     // get block properties
     int threads_per_block = threads;
-    int shared_mem_per_block = INTERPOLATE_MEM + sizeof(int) * COMMON_SIZE + sizeof(bool);
+    int shared_mem_per_block = INTERPOLATE_MEM + sizeof(int) * COMMON_SIZE + sizeof(data_element) + sizeof(bool);
     int regs_per_thread = REGS_PER_THREAD;
 
     // calculate threadblocks
@@ -385,7 +394,7 @@ void persistent_kernel(uchar* maps, MPMCqueue* tasks, MPMCqueue* results, cuda::
         printf("Thread block %d is alive\n", blockIdx.x);
     }
     __shared__ bool flag;
-    data_element task;
+    __shared__ data_element task;
     uchar* block_maps = maps + blockIdx.x * TILE_COUNT * TILE_COUNT * COMMON_SIZE;
     while (true) {
         if (threadIdx.x == 0) {
@@ -396,20 +405,14 @@ void persistent_kernel(uchar* maps, MPMCqueue* tasks, MPMCqueue* results, cuda::
             break;
         }
         if (threadIdx.x == 0) {
-            flag = !tasks->gpu_pop(&task);
+            tasks->gpu_pop(&task);
         }
-        __syncthreads();
-        if (flag)
-        {
-            continue;
-        }
-        
         __syncthreads();
         process_image(task.img_in, task.img_out, block_maps);
         __syncthreads();
         if (threadIdx.x == 0) {
             printf("Thread block %d finished processing image %d\n", blockIdx.x, task.img_id);
-            while(!results->gpu_push(task));
+            results->gpu_push(task);
         }
         __syncthreads();
     }
@@ -428,8 +431,8 @@ private:
 public:
     queue_server(int threads) {
         // Allocate memory for atomic<bool>
-        CUDA_CHECK(cudaMallocManaged(&stop_kernel, sizeof(cuda::atomic<bool>)));
-        *stop_kernel = false;
+        CUDA_CHECK( cudaHostAlloc(&this->stop_kernel, sizeof(cuda::atomic<bool>), cudaHostAllocDefault) );
+        ::new(this->stop_kernel) cuda::atomic<bool>(false);
 
         thread_blocks = 1; // calculate_threadblocks_count(threads);
         printf("Thread blocks: %d\n", thread_blocks);
@@ -456,10 +459,20 @@ public:
             return;
         }
         // Free resources allocated in constructor
-        delete tasks;
-        delete results;
-        cudaFree(stop_kernel);
-        cudaFree(taskmaps);
+        if (stop_kernel != nullptr) {
+            stop_kernel->~atomic<bool>();
+            CUDA_CHECK(cudaFreeHost(stop_kernel));
+        }
+        if (tasks != nullptr) {
+            delete tasks;
+        }
+        if (results != nullptr) {
+            delete results;
+        }
+        if (pinned_queues != nullptr) {
+            CUDA_CHECK(cudaFreeHost(pinned_queues));
+        }
+        CUDA_CHECK(cudaFree(taskmaps));
     }
 
     bool enqueue(int img_id, uchar* img_in, uchar* img_out) override {

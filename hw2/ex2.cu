@@ -38,26 +38,14 @@ int calculate_upper_log2(int n) {
 }
 
 __device__ void prefix_sum(int arr[], int arr_size) {
-    // TODO complete according to hw1
     int tid = threadIdx.x;
-    // int num_threads = blockDim.x;
-    // extern __shared__ int temp[];
     int increase;
     for (int stride = 1; stride < arr_size; stride *= 2) {
-        // for (int i = tid; i < arr_size; i += num_threads) {
-        //     if (i >= stride) {
-        //         temp[i] = arr[i - stride];
-        //     }
-        // }
         if ((tid >= stride) && (tid < arr_size)) {
             increase = arr[tid - stride];
         } 
         __syncthreads();
-        // for (int i = tid; i < arr_size; i += num_threads) {
-        //     if (i >= stride) {
-        //         arr[i] += temp[i];
-        //     }
-        // }
+
         if ((tid >= stride) && (tid < arr_size)) {
             arr[tid] += increase;
         }
@@ -79,7 +67,6 @@ __device__
 
 __device__
 void process_image(uchar *in, uchar *out, uchar* maps) {
-    // TODO complete according to hw1
     int tid = threadIdx.x;
     int block_size = blockDim.x;
     __shared__ int sharedHistogram[COMMON_SIZE];
@@ -94,7 +81,6 @@ void process_image(uchar *in, uchar *out, uchar* maps) {
             
             // // Debug print for shared memory initialization
             // if (tid == 0) {
-            //     printf("Thread block %d Processing tile %d %d\n", blockIdx.x, row_tile_n, col_tile_n);
             //     debug_msg("Shared Histogram Initialized:", sharedHistogram, COMMON_SIZE);
             // }
             // __syncthreads();
@@ -136,10 +122,6 @@ void process_image(uchar *in, uchar *out, uchar* maps) {
             __syncthreads();
         }
     }
-    // if (tid == 0) {
-    //     printf("Thread block %d before interpolate_device\n", blockIdx.x);
-    // }
-    // __syncthreads();
     interpolate_device(maps, in, out);
     return;
 }
@@ -164,7 +146,7 @@ void process_image_kernel(uchar *in, uchar *out, uchar* maps){
 class streams_server : public image_processing_server
 {
 private:
-    // TODO define stream server context (memory buffers, streams, etc...)
+    // define stream server context (memory buffers, streams, etc...)
     cudaStream_t streams[STREAM_COUNT];
     uchar* maps;
     uchar* in_image;
@@ -173,29 +155,39 @@ private:
 
 public:
     streams_server() {
-        // TODO initialize context (memory buffers, streams, etc...)
+        // initialize context (memory buffers, streams, etc...)
         for (int i = 0; i < STREAM_COUNT; i++) {
             CUDA_CHECK(cudaStreamCreate(&streams[i]));
             image_id[i] = -1;
         }
-        CUDA_CHECK(cudaHostAlloc(&maps, sizeof(uchar) * STREAM_COUNT * TILE_COUNT * TILE_COUNT * COMMON_SIZE, cudaHostAllocDefault));
+        CUDA_CHECK(cudaMalloc(&maps, sizeof(uchar) * STREAM_COUNT * TILE_COUNT * TILE_COUNT * COMMON_SIZE));
+        CUDA_CHECK(cudaMalloc(&in_image, sizeof(uchar) * STREAM_COUNT * IMG_HEIGHT * IMG_WIDTH));
+        CUDA_CHECK(cudaMalloc(&out_image, sizeof(uchar) * STREAM_COUNT * IMG_HEIGHT * IMG_WIDTH));
     }
 
     ~streams_server() override {
-        // TODO free resources allocated in constructor
+        // free resources allocated in constructor
         for (int i = 0; i < STREAM_COUNT; i++) {
             CUDA_CHECK(cudaStreamDestroy(streams[i]));
         }
-        CUDA_CHECK(cudaFreeHost(maps));
+        CUDA_CHECK(cudaFree(maps));
+        CUDA_CHECK(cudaFree(in_image));
+        CUDA_CHECK(cudaFree(out_image));
     }
 
     bool enqueue(int img_id, uchar *img_in, uchar *img_out) override {
-        // TODO place memory transfers and kernel invocation in streams if possible.
+        // place memory transfers and kernel invocation in streams if possible.
         for (int i = 0; i < STREAM_COUNT; i++) {
             if (image_id[i] == -1) {
                 image_id[i] = img_id;
                 uchar* maps_d = this->maps + i * TILE_COUNT * TILE_COUNT * COMMON_SIZE;
-                process_image_kernel<<<1, STREAM_THREADS, 0, streams[i]>>>(img_in, img_out, maps_d);
+                uchar* img_in_d = this->in_image + i * IMG_HEIGHT * IMG_WIDTH;
+                uchar* img_out_d = this->out_image + i * IMG_HEIGHT * IMG_WIDTH;
+                CUDA_CHECK(cudaMemcpyAsync(img_in_d, img_in, sizeof(uchar) * IMG_HEIGHT * IMG_WIDTH,
+                                            cudaMemcpyHostToDevice, streams[i]));
+                process_image_kernel<<<1, STREAM_THREADS, 0, streams[i]>>>(img_in_d, img_out_d, maps_d);
+                CUDA_CHECK(cudaMemcpyAsync(img_out, img_out_d, sizeof(uchar) * IMG_HEIGHT * IMG_WIDTH,
+                                            cudaMemcpyDeviceToHost, streams[i]));
                 return true;
             }
         }
@@ -203,17 +195,15 @@ public:
     }
 
     bool dequeue(int *img_id) override {
-        // TODO query (don't block) streams for any completed requests.
+        // query (don't block) streams for any completed requests.
         for (int i = 0; i < STREAM_COUNT; i++) {
-            cudaError_t status = cudaStreamQuery(streams[i]); // TODO query diffrent stream each iteration
+            cudaError_t status = cudaStreamQuery(streams[i]); // query diffrent stream each iteration
             switch (status) {
             case cudaSuccess:
-                // TODO return the img_id of the request that was completed.
                 if (image_id[i] == -1) {
                     continue;
                 }
                 *img_id = image_id[i];
-                // printf("Image %d is ready\n", *img_id);
                 image_id[i] = -1;
                 return true;
             case cudaErrorNotReady:
@@ -255,7 +245,9 @@ public:
     __device__ void lock() {
         while (true) {
             if (gpu_lock_state->load(cuda::memory_order_acquire) == 0) {
+                // Try to acquire lock
                 if (gpu_lock_state->exchange(1, cuda::memory_order_acquire) == 0) {
+                    // Lock acquired, return
                     return;
                 }
             }
@@ -310,7 +302,6 @@ public:
         queue[tail % max_size] = item;
         _tail->store(tail + 1, cuda::memory_order_release);
         lock.unlock();
-        // printf("Thread block %d pushed image %d\n", blockIdx.x, item.img_id);
         return true;
     }
 
@@ -324,7 +315,6 @@ public:
         *item = queue[head % max_size];
         _head->store(head + 1, cuda::memory_order_release);
         lock.unlock();
-        // printf("Thread block %d popped image %d with value of %d in last place\n", blockIdx.x, item->img_id, item->img_in[IMG_HEIGHT * IMG_WIDTH - 1]);
         return true;
     }
 
@@ -392,9 +382,6 @@ int calculate_threadblocks_count(int threads) {
 
 __global__
 void persistent_kernel(uchar* maps, MPMCqueue* tasks, MPMCqueue* results, cuda::atomic<bool>* stop_kernel) {
-    // if (threadIdx.x == 0) {
-    //     printf("Thread block %d is alive\n", blockIdx.x);
-    // }
     __shared__ bool flag;
     __shared__ data_element task;
     uchar* block_maps = maps + blockIdx.x * TILE_COUNT * TILE_COUNT * COMMON_SIZE;
@@ -407,17 +394,16 @@ void persistent_kernel(uchar* maps, MPMCqueue* tasks, MPMCqueue* results, cuda::
             break;
         }
         if (threadIdx.x == 0) {
-            flag = tasks->gpu_pop(&task);
+            flag = !tasks->gpu_pop(&task);
         }
         __syncthreads();
-        if (!flag) {
+        if (flag) {
             continue;
         }
         __syncthreads();
         process_image(task.img_in, task.img_out, block_maps);
         __syncthreads();
         if (threadIdx.x == 0) {
-            // printf("Thread block %d finished processing image %d\n", blockIdx.x, task.img_id);
             while(!results->gpu_push(task));
         }
         __syncthreads();
@@ -440,10 +426,9 @@ public:
         CUDA_CHECK( cudaHostAlloc(&this->stop_kernel, sizeof(cuda::atomic<bool>), cudaHostAllocDefault) );
         ::new(this->stop_kernel) cuda::atomic<bool>(false);
 
+        // Calculate threadblocks count and max queue size
         thread_blocks = calculate_threadblocks_count(threads);
-        // printf("Thread blocks: %d\n", thread_blocks);
         max_queue_size = 1 << calculate_upper_log2(thread_blocks << 4);
-        // printf("Max queue size: %d\n", max_queue_size);
 
         // Allocate memory for queues
         CUDA_CHECK(cudaMallocHost(&pinned_queues, sizeof(MPMCqueue) * 2));
@@ -469,7 +454,6 @@ public:
             stop_kernel->~atomic<bool>();
             CUDA_CHECK(cudaFreeHost(stop_kernel));
         }
-        // printf("Freeing resources\n");
         if (tasks != nullptr) {
             this->tasks->~MPMCqueue();
         }
@@ -496,7 +480,6 @@ public:
             return false;
         }
         *img_id = task.img_id;
-        // printf("Image %d is ready\n", *img_id);
         return true;
     }
 };

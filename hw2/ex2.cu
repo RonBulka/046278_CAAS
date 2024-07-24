@@ -358,26 +358,38 @@ int calculate_threadblocks_count(int threads) {
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, device));
     int SM_count = deviceProp.multiProcessorCount;
+    // printf("SM count: %d\n", SM_count);
     int max_threads_per_SM = deviceProp.maxThreadsPerMultiProcessor;
+    // printf("Max threads per SM: %d\n", max_threads_per_SM);
     int max_blocks_per_SM = deviceProp.maxBlocksPerMultiProcessor;
+    // printf("Max blocks per SM: %d\n", max_blocks_per_SM);
     int max_shared_mem_per_SM = deviceProp.sharedMemPerMultiprocessor;
+    // printf("Max shared memory per SM: %d\n", max_shared_mem_per_SM);
     int max_regs_per_SM = deviceProp.regsPerMultiprocessor;
+    // printf("Max regs per SM: %d\n", max_regs_per_SM);
 
     // get block properties
     int threads_per_block = threads;
-    int shared_mem_per_block = INTERPOLATE_MEM + sizeof(int) * COMMON_SIZE + sizeof(data_element) + sizeof(bool);
+    cudaFuncAttributes attr;
+    CUDA_CHECK(cudaFuncGetAttributes(&attr, persistent_kernel));
+    int shared_mem_per_block = attr.sharedSizeBytes;
+    // printf("Shared memory per block: %d\n", shared_mem_per_block);
     int regs_per_thread = REGS_PER_THREAD;
 
     // calculate threadblocks
     int threadblocks = max_blocks_per_SM;
+    // printf("Max blocks per SM: %d\n", max_blocks_per_SM);
     // thread constraint
     threadblocks = min(threadblocks, (max_threads_per_SM / threads_per_block));
+    // printf("Max blocks per SM after threads: %d\n", threadblocks);
     // shared memory constraint
     threadblocks = min(threadblocks, (max_shared_mem_per_SM / shared_mem_per_block));
+    // printf("Max blocks per SM after shared mem: %d\n", threadblocks);
     // register constraint
     threadblocks = min(threadblocks, (max_regs_per_SM / (threads_per_block * regs_per_thread)));
+    // printf("Max blocks per SM after regs: %d\n", threadblocks);
 
-    return threadblocks * SM_count;
+    return (threadblocks * SM_count);
 }
 
 __global__

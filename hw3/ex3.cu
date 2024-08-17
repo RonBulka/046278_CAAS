@@ -252,6 +252,7 @@ private:
     std::unique_ptr<image_processing_server> server;
 
     /* TODO: add memory region(s) for CPU-GPU queues */
+    struct ibv_mr *mr_queues;
 
 public:
     explicit server_queues_context(uint16_t tcp_port) : rdma_server_context(tcp_port)
@@ -260,11 +261,13 @@ public:
 
         /* TODO Exchange rkeys, addresses, and necessary information (e.g.
          * number of queues) with the client */
+        
     }
 
     ~server_queues_context()
     {
         /* TODO destroy the additional server MRs here */
+
     }
 
     virtual void event_loop() override
@@ -311,6 +314,7 @@ public:
     {
         /* TODO use RDMA Write and RDMA Read operations to enqueue the task on
          * a CPU-GPU producer consumer queue running on the server. */
+
         return false;
     }
 
@@ -318,6 +322,7 @@ public:
     {
         /* TODO use RDMA Write and RDMA Read operations to detect the completion and dequeue a processed image
          * through a CPU-GPU producer consumer queue running on the server. */
+
         return false;
     }
 };

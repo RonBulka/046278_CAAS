@@ -251,13 +251,52 @@ class server_queues_context : public rdma_server_context {
 private:
     std::unique_ptr<image_processing_server> server;
 
-    /* TODO: add memory region(s) for CPU-GPU queues */
-    struct ibv_mr *mr_queues;
+    task_metadata *metadata;                // Metadata for tasks
+    int *completion_queue;                  // Completion queue buffer
+    data_element *task_queue;               // Task queue buffer
 
+    /* TODO: add memory region(s) for CPU-GPU queues */
+    struct ibv_mr *mr_metadata;             // Memory region for task metadata
+    struct ibv_mr *mr_completion_queue;     // Memory region for completion queue
+    struct ibv_mr *mr_task_queue;           // Memory region for task queue
 public:
     explicit server_queues_context(uint16_t tcp_port) : rdma_server_context(tcp_port)
     {
+        server = create_queues_server(THREADS_PER_BLOCK);
         /* TODO Initialize additional server MRs as needed. */
+        metadata = (task_metadata *)malloc(sizeof(task_metadata) * 256);
+        if (!metadata) {
+            perror("malloc() failed");
+            exit(1);
+        }
+        mr_metadata = ibv_reg_mr(pd, metadata, sizeof(task_metadata) * 256, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!mr_metadata) {
+            perror("ibv_reg_mr() failed for metadata");
+            exit(1);
+        }
+
+        completion_queue = (int *)malloc(sizeof(int) * 256);
+        if (!completion_queue) {
+            perror("malloc() failed");
+            exit(1);
+        }
+        mr_completion_queue = ibv_reg_mr(pd, completion_queue, sizeof(int) * 256, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!mr_completion_queue) {
+            perror("ibv_reg_mr() failed for completion queue");
+            exit(1);
+        }
+
+        task_queue = (data_element *)malloc(sizeof(data_element) * 256);
+        if (!task_queue) {
+            perror("malloc() failed");
+            exit(1);
+        }
+        mr_task_queue = ibv_reg_mr(pd, task_queue, sizeof(data_element) * 256, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!mr_task_queue) {
+            perror("ibv_reg_mr() failed for task queue");
+            exit(1);
+        }
+        
 
         /* TODO Exchange rkeys, addresses, and necessary information (e.g.
          * number of queues) with the client */
@@ -267,7 +306,17 @@ public:
     ~server_queues_context()
     {
         /* TODO destroy the additional server MRs here */
+        ibv_dereg_mr(this->mr_images_in);
+        ibv_dereg_mr(this->mr_images_out);
+        ibv_dereg_mr(this->mr_metadata);
+        ibv_dereg_mr(this->mr_completion_queue);
+        ibv_dereg_mr(this->mr_task_queue);
 
+        free(this->images_in);
+        free(this->images_out);
+        free(this->metadata);
+        free(this->completion_queue);
+        free(this->task_queue);
     }
 
     virtual void event_loop() override

@@ -7,6 +7,7 @@
 
 #define COMMON_SIZE 256
 #define REGS_PER_THREAD 32
+#define THREADS_PER_BLOCK 256
 
 class queue_server;
 class MPMCqueue;
@@ -16,6 +17,11 @@ typedef struct data_element_t {
     uchar *img_in;
     uchar *img_out;
 } data_element;
+
+struct task_metadata {
+    int img_id;
+    int status;  // 0: pending, 1: processing, 2: completed
+};
 
 __global__ void persistent_kernel(uchar* maps, MPMCqueue* tasks, MPMCqueue* results, cuda::atomic<bool>* stop_kernel);
 __device__ void debug_msg(const char* msg, int hist[], int hist_size);

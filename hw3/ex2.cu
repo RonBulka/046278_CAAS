@@ -18,10 +18,22 @@ typedef struct data_element_t {
     uchar *img_out;
 } data_element;
 
-struct task_metadata {
+typedef struct task_metadata_t {
     int img_id;
     int status;  // 0: pending, 1: processing, 2: completed
-};
+} task_metadata;
+
+typedef struct connection_info_t {
+    uint32_t tasks_MPMCqueue_rkey;
+    uint64_t tasks_MPMCqueue_addr;
+    uint32_t results_MPMCqueue_rkey;
+    uint64_t results_MPMCqueue_addr;
+    uint32_t tasks_queue_rkey;
+    uint64_t tasks_queue_addr;
+    uint32_t results_queue_rkey;
+    uint64_t results_queue_addr;
+    size_t queue_size;
+} connection_info;
 
 __global__ void persistent_kernel(uchar* maps, MPMCqueue* tasks, MPMCqueue* results, cuda::atomic<bool>* stop_kernel);
 __device__ void debug_msg(const char* msg, int hist[], int hist_size);
@@ -235,6 +247,14 @@ public:
         }
     }
 
+    size_t get_max_size() {
+        return max_size;
+    }
+
+    data_element* get_queue() {
+        return queue;
+    }
+
     __device__ bool gpu_push(const data_element &item) {
         lock.lock();
         size_t tail = _tail->load(cuda::memory_order_relaxed);
@@ -424,6 +444,18 @@ public:
             CUDA_CHECK(cudaFreeHost(pinned_queues));
         }
         CUDA_CHECK(cudaFree(taskmaps));
+    }
+
+    size_t get_max_queue_size() {
+        return this->max_queue_size;
+    }
+
+    MPMCqueue* get_tasks() {
+        return this->tasks;
+    }
+
+    MPMCqueue* get_results() {
+        return this->results;
     }
 
     bool enqueue(int img_id, uchar *img_in, uchar *img_out) override {

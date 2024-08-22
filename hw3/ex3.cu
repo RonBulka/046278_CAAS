@@ -249,58 +249,71 @@ public:
 
 class server_queues_context : public rdma_server_context {
 private:
-    std::unique_ptr<image_processing_server> server;
-
-    task_metadata *metadata;                // Metadata for tasks
-    int *completion_queue;                  // Completion queue buffer
-    data_element *task_queue;               // Task queue buffer
+    std::unique_ptr<queue_server> server;
 
     /* TODO: add memory region(s) for CPU-GPU queues */
-    struct ibv_mr *mr_metadata;             // Memory region for task metadata
-    struct ibv_mr *mr_completion_queue;     // Memory region for completion queue
-    struct ibv_mr *mr_task_queue;           // Memory region for task queue
+    struct ibv_mr *mr_tasks_MPMCqueue;      // Memory region for tasks MPMCqueue
+    struct ibv_mr *mr_results_MPMCqueue;    // Memory region for results MPMCqueue
+    struct ibv_mr *mr_tasks_queue;          // Memory region for tasks queue
+    struct ibv_mr *mr_results_queue;        // Memory region for results queue
 public:
     explicit server_queues_context(uint16_t tcp_port) : rdma_server_context(tcp_port)
     {
         server = create_queues_server(THREADS_PER_BLOCK);
         /* TODO Initialize additional server MRs as needed. */
-        metadata = (task_metadata *)malloc(sizeof(task_metadata) * 256);
-        if (!metadata) {
-            perror("malloc() failed");
-            exit(1);
-        }
-        mr_metadata = ibv_reg_mr(pd, metadata, sizeof(task_metadata) * 256, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-        if (!mr_metadata) {
-            perror("ibv_reg_mr() failed for metadata");
+        enum ibv_access_flags access_flags = static_cast<ibv_access_flags>(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
+        size_t queue_size = server->get_max_queue_size();
+        MPMCqueue *task_MPMCqueue = server->get_tasks();
+        MPMCqueue *results_MPMCqueue = server->get_results();
+        data_element *task_queue = task_MPMCqueue->get_queue();
+        data_element *results_queue = results_MPMCqueue->get_queue();
+
+        mr_tasks_MPMCqueue = ibv_reg_mr(pd, task_MPMCqueue, sizeof(MPMCqueue), access_flags);
+        if (!mr_tasks_MPMCqueue) {
+            perror("ibv_reg_mr() failed for tasks MPMCqueue");
             exit(1);
         }
 
-        completion_queue = (int *)malloc(sizeof(int) * 256);
-        if (!completion_queue) {
-            perror("malloc() failed");
-            exit(1);
-        }
-        mr_completion_queue = ibv_reg_mr(pd, completion_queue, sizeof(int) * 256, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-        if (!mr_completion_queue) {
-            perror("ibv_reg_mr() failed for completion queue");
+        mr_results_MPMCqueue = ibv_reg_mr(pd, results_MPMCqueue, sizeof(MPMCqueue), access_flags);
+        if (!mr_results_MPMCqueue) {
+            perror("ibv_reg_mr() failed for results MPMCqueue");
             exit(1);
         }
 
-        task_queue = (data_element *)malloc(sizeof(data_element) * 256);
-        if (!task_queue) {
-            perror("malloc() failed");
+        mr_tasks_queue = ibv_reg_mr(pd, task_queue, queue_size * sizeof(data_element), access_flags);
+        if (!mr_tasks_queue) {
+            perror("ibv_reg_mr() failed for tasks queue");
             exit(1);
         }
-        mr_task_queue = ibv_reg_mr(pd, task_queue, sizeof(data_element) * 256, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-        if (!mr_task_queue) {
-            perror("ibv_reg_mr() failed for task queue");
+
+        mr_results_queue = ibv_reg_mr(pd, results_queue, queue_size * sizeof(data_element), access_flags);
+        if (!mr_results_queue) {
+            perror("ibv_reg_mr() failed for results queue");
             exit(1);
         }
         
 
         /* TODO Exchange rkeys, addresses, and necessary information (e.g.
          * number of queues) with the client */
-        
+        // TODO: send the rkeys and addresses to the client
+        // init struct to send to client
+        connection_info info = {};
+        info.tasks_MPMCqueue_rkey = mr_tasks_MPMCqueue->rkey;
+        info.tasks_MPMCqueue_addr = (uintptr_t)task_MPMCqueue;
+        info.results_MPMCqueue_rkey = mr_results_MPMCqueue->rkey;
+        info.results_MPMCqueue_addr = (uintptr_t)results_MPMCqueue;
+        info.tasks_queue_rkey = mr_tasks_queue->rkey;
+        info.tasks_queue_addr = (uintptr_t)task_queue;
+        info.results_queue_rkey = mr_results_queue->rkey;
+        info.results_queue_addr = (uintptr_t)results_queue;
+        info.queue_size = queue_size;
+
+        /* send the connection info to the client */
+        if (send(this->socket_fd, &info, sizeof(info), 0) < 0) {
+            perror("send() failed");
+            exit(1);
+        }
+
     }
 
     ~server_queues_context()
@@ -308,15 +321,14 @@ public:
         /* TODO destroy the additional server MRs here */
         ibv_dereg_mr(this->mr_images_in);
         ibv_dereg_mr(this->mr_images_out);
-        ibv_dereg_mr(this->mr_metadata);
-        ibv_dereg_mr(this->mr_completion_queue);
-        ibv_dereg_mr(this->mr_task_queue);
+        ibv_dereg_mr(this->mr_tasks_MPMCqueue);
+        ibv_dereg_mr(this->mr_results_MPMCqueue);
+        ibv_dereg_mr(this->mr_tasks_queue);
+        ibv_dereg_mr(this->mr_results_queue);
 
         free(this->images_in);
         free(this->images_out);
-        free(this->metadata);
-        free(this->completion_queue);
-        free(this->task_queue);
+        server->~queue_server();
     }
 
     virtual void event_loop() override
@@ -335,6 +347,10 @@ private:
     struct ibv_mr *mr_images_in; /* Memory region for input images */
     struct ibv_mr *mr_images_out; /* Memory region for output images */
     /* TODO define other memory regions used by the client here */
+    struct ibv_mr *mr_tasks_MPMCqueue;      // Memory region for tasks MPMCqueue
+    struct ibv_mr *mr_results_MPMCqueue;    // Memory region for results MPMCqueue
+    struct ibv_mr *mr_tasks_queue;          // Memory region for tasks queue
+    struct ibv_mr *mr_results_queue;        // Memory region for results queue
 
 public:
     client_queues_context(uint16_t tcp_port) : rdma_client_context(tcp_port)
@@ -342,6 +358,11 @@ public:
         /* TODO communicate with server to discover number of queues, necessary
          * rkeys / address, or other additional information needed to operate
          * the GPU queues remotely. */
+        connection_info info;
+        if (recv(this->socket_fd, &info, sizeof(info), 0) < 0) {
+            perror("recv() failed");
+            exit(1);
+        }
     }
 
     ~client_queues_context()
@@ -352,11 +373,23 @@ public:
     virtual void set_input_images(uchar *images_in, size_t bytes) override
     {
         // TODO register memory
+        /* register a memory region for the input images. */
+        mr_images_in = ibv_reg_mr(pd, images_in, bytes, IBV_ACCESS_REMOTE_READ);
+        if (!mr_images_in) {
+            perror("ibv_reg_mr() failed for input images");
+            exit(1);
+        }
     }
 
     virtual void set_output_images(uchar *images_out, size_t bytes) override
     {
         // TODO register memory
+        /* register a memory region for the output images. */
+        mr_images_out = ibv_reg_mr(pd, images_out, bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!mr_images_out) {
+            perror("ibv_reg_mr() failed for output images");
+            exit(1);
+        }
     }
 
     virtual bool enqueue(int img_id, uchar *img_in, uchar *img_out) override

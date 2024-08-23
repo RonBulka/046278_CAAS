@@ -11,6 +11,13 @@
 
 #include <infiniband/verbs.h>
 
+#define KILL_SERVER (-1)
+#define HEAD (true)
+#define TAIL (false)
+#define COPY_TO_SERVER (true)
+#define COPY_FROM_SERVER (false)
+
+/********************************* RPC implementation *********************************/
 class server_rpc_context : public rdma_server_context {
 private:
     std::unique_ptr<queue_server> gpu_context;
@@ -247,42 +254,113 @@ public:
     }
 };
 
+/************************************ Helper functions ***********************************/
+void post_atomic_fa(struct ibv_qp *qp, uint64_t remote_addr, uint32_t rkey, uint64_t add_val) {
+    struct ibv_sge sge;
+    sge.addr = 0;               // FA doesn't use local data
+    sge.length = 0;
+    sge.lkey = 0;
+
+    struct ibv_send_wr wr = {};
+    wr.wr_id = 0;               // User-defined ID
+    wr.opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.wr.atomic.remote_addr = remote_addr;
+    wr.wr.atomic.rkey = rkey;
+    wr.wr.atomic.compare_add = add_val;
+
+    struct ibv_send_wr *bad_wr = nullptr;
+    int ret = ibv_post_send(qp, &wr, &bad_wr);
+    if (ret) {
+        fprintf(stderr, "Failed to post atomic fetch-and-add operation\n");
+        exit(1);
+    }
+}
+
+void post_atomic_cas(struct ibv_qp *qp, uint64_t remote_addr, uint32_t rkey, uint64_t new_val, 
+                        uint64_t expected_val, uint32_t lkey, uint64_t *previous_val) {
+    struct ibv_sge sge;
+    sge.addr = (uintptr_t)previous_val;     // Local address to store previous value
+    sge.length = sizeof(uint64_t);
+    sge.lkey = lkey;                        // Local memory region key
+
+    struct ibv_send_wr wr = {};
+    wr.wr_id = 0;               // User-defined ID
+    wr.opcode = IBV_WR_ATOMIC_CMP_AND_SWP;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.wr.atomic.remote_addr = remote_addr;
+    wr.wr.atomic.rkey = rkey;
+    wr.wr.atomic.compare_add = expected_val;    // This is the compare value in CAS
+    wr.wr.atomic.swap = new_val;                // This is the swap value in CAS
+
+    struct ibv_send_wr *bad_wr = nullptr;
+    int ret = ibv_post_send(qp, &wr, &bad_wr);
+    if (ret) {
+        fprintf(stderr, "Failed to post atomic compare-and-swap operation\n");
+        exit(1);
+    }
+}
+
+/********************************* Queues implementation *********************************/
+
 class server_queues_context : public rdma_server_context {
 private:
     std::unique_ptr<queue_server> server;
 
     /* TODO: add memory region(s) for CPU-GPU queues */
-    struct ibv_mr *mr_tasks_MPMCqueue;      // Memory region for tasks MPMCqueue
-    struct ibv_mr *mr_results_MPMCqueue;    // Memory region for results MPMCqueue
     struct ibv_mr *mr_tasks_queue;          // Memory region for tasks queue
+    struct ibv_mr *mr_tasks_head;           // Memory region for tasks head
+    struct ibv_mr *mr_tasks_tail;           // Memory region for tasks tail
     struct ibv_mr *mr_results_queue;        // Memory region for results queue
+    struct ibv_mr *mr_results_head;         // Memory region for results head
+    struct ibv_mr *mr_results_tail;         // Memory region for results tail
+
+    // helper data
+    size_t queue_size;
+    MPMCqueue *tasks_MPMCqueue;
+    data_element *tasks_queue;
+    cuda::atomic<size_t> *tasks_head;
+    cuda::atomic<size_t> *tasks_tail;
+
+    MPMCqueue *results_MPMCqueue;
+    data_element *results_queue;
+    cuda::atomic<size_t> *results_head;
+    cuda::atomic<size_t> *results_tail;
 public:
-    explicit server_queues_context(uint16_t tcp_port) : rdma_server_context(tcp_port)
-    {
+    explicit server_queues_context(uint16_t tcp_port) : rdma_server_context(tcp_port) {
         server = create_queues_server(THREADS_PER_BLOCK);
         /* TODO Initialize additional server MRs as needed. */
-        enum ibv_access_flags access_flags = static_cast<ibv_access_flags>(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
-        size_t queue_size = server->get_max_queue_size();
-        MPMCqueue *task_MPMCqueue = server->get_tasks();
-        MPMCqueue *results_MPMCqueue = server->get_results();
-        data_element *task_queue = task_MPMCqueue->get_queue();
-        data_element *results_queue = results_MPMCqueue->get_queue();
+        enum ibv_access_flags access_flags = static_cast<ibv_access_flags>(IBV_ACCESS_LOCAL_WRITE | \
+                                                                           IBV_ACCESS_REMOTE_READ | \
+                                                                           IBV_ACCESS_REMOTE_WRITE);
+        queue_size = server->get_max_queue_size();
+        tasks_MPMCqueue = server->get_tasks();
+        tasks_queue = tasks_MPMCqueue->get_queue();
+        tasks_head = tasks_MPMCqueue->get__head();
+        tasks_tail = tasks_MPMCqueue->get__tail();
 
-        mr_tasks_MPMCqueue = ibv_reg_mr(pd, task_MPMCqueue, sizeof(MPMCqueue), access_flags);
-        if (!mr_tasks_MPMCqueue) {
-            perror("ibv_reg_mr() failed for tasks MPMCqueue");
-            exit(1);
-        }
+        results_MPMCqueue = server->get_results();
+        results_queue = results_MPMCqueue->get_queue();
+        results_head = results_MPMCqueue->get__head();
+        results_tail = results_MPMCqueue->get__tail();
 
-        mr_results_MPMCqueue = ibv_reg_mr(pd, results_MPMCqueue, sizeof(MPMCqueue), access_flags);
-        if (!mr_results_MPMCqueue) {
-            perror("ibv_reg_mr() failed for results MPMCqueue");
-            exit(1);
-        }
-
-        mr_tasks_queue = ibv_reg_mr(pd, task_queue, queue_size * sizeof(data_element), access_flags);
+        mr_tasks_queue = ibv_reg_mr(pd, tasks_queue, queue_size * sizeof(data_element), access_flags);
         if (!mr_tasks_queue) {
             perror("ibv_reg_mr() failed for tasks queue");
+            exit(1);
+        }
+
+        mr_tasks_head = ibv_reg_mr(pd, tasks_head, sizeof(cuda::atomic<size_t>), access_flags | IBV_ACCESS_REMOTE_ATOMIC);
+        if (!mr_tasks_head) {
+            perror("ibv_reg_mr() failed for tasks head");
+            exit(1);
+        }
+
+        mr_tasks_tail = ibv_reg_mr(pd, tasks_tail, sizeof(cuda::atomic<size_t>), access_flags | IBV_ACCESS_REMOTE_ATOMIC);
+        if (!mr_tasks_tail) {
+            perror("ibv_reg_mr() failed for tasks tail");
             exit(1);
         }
 
@@ -291,51 +369,123 @@ public:
             perror("ibv_reg_mr() failed for results queue");
             exit(1);
         }
-        
+
+        mr_results_head = ibv_reg_mr(pd, results_head, sizeof(cuda::atomic<size_t>), access_flags | IBV_ACCESS_REMOTE_ATOMIC);
+        if (!mr_results_head) {
+            perror("ibv_reg_mr() failed for results head");
+            exit(1);
+        }
+
+        mr_results_tail = ibv_reg_mr(pd, results_tail, sizeof(cuda::atomic<size_t>), access_flags | IBV_ACCESS_REMOTE_ATOMIC);
+        if (!mr_results_tail) {
+            perror("ibv_reg_mr() failed for results tail");
+            exit(1);
+        }
 
         /* TODO Exchange rkeys, addresses, and necessary information (e.g.
          * number of queues) with the client */
         // TODO: send the rkeys and addresses to the client
         // init struct to send to client
-        connection_info info = {};
-        info.tasks_MPMCqueue_rkey = mr_tasks_MPMCqueue->rkey;
-        info.tasks_MPMCqueue_addr = (uintptr_t)task_MPMCqueue;
-        info.results_MPMCqueue_rkey = mr_results_MPMCqueue->rkey;
-        info.results_MPMCqueue_addr = (uintptr_t)results_MPMCqueue;
-        info.tasks_queue_rkey = mr_tasks_queue->rkey;
-        info.tasks_queue_addr = (uintptr_t)task_queue;
-        info.results_queue_rkey = mr_results_queue->rkey;
-        info.results_queue_addr = (uintptr_t)results_queue;
-        info.queue_size = queue_size;
+        rdma_connection_info info = {};
+        init_rdma_connection_info(&info);
 
         /* send the connection info to the client */
-        if (send(this->socket_fd, &info, sizeof(info), 0) < 0) {
-            perror("send() failed");
-            exit(1);
-        }
-
+        send_over_socket(&info, sizeof(rdma_connection_info));
     }
 
-    ~server_queues_context()
-    {
+    ~server_queues_context() {
         /* TODO destroy the additional server MRs here */
         ibv_dereg_mr(this->mr_images_in);
         ibv_dereg_mr(this->mr_images_out);
-        ibv_dereg_mr(this->mr_tasks_MPMCqueue);
-        ibv_dereg_mr(this->mr_results_MPMCqueue);
+
         ibv_dereg_mr(this->mr_tasks_queue);
+        ibv_dereg_mr(this->mr_tasks_head);
+        ibv_dereg_mr(this->mr_tasks_tail);
+
         ibv_dereg_mr(this->mr_results_queue);
+        ibv_dereg_mr(this->mr_results_head);
+        ibv_dereg_mr(this->mr_results_tail);
 
         free(this->images_in);
         free(this->images_out);
         server->~queue_server();
     }
 
-    virtual void event_loop() override
-    {
+    virtual void event_loop() override {
         /* TODO simplified version of server_rpc_context::event_loop. As the
          * client use one sided operations, we only need one kind of message to
          * terminate the server at the end. */
+        rpc_request* req;
+        bool terminate = false;
+
+        while (!terminate) {
+            struct ibv_wc wc;
+            int ncqes = ibv_poll_cq(cq, 1, &wc);
+
+            if (ncqes < 0) {
+                perror("ibv_poll_cq() failed");
+                exit(1);
+            }
+
+            if (ncqes > 0) {
+                VERBS_WC_CHECK(wc);
+
+                switch (wc.opcode) {
+                    case IBV_WC_RECV:
+                        /* Received a new request from the client */
+                        req = &requests[wc.wr_id];
+
+                        /* Terminate signal */
+                        if (req->request_id == KILL_SERVER) {
+                            //printf("Terminating...\n");
+                            terminate = true;
+                            post_rdma_write(
+                                req->output_addr,                       // remote_dst
+                                0,     // len
+                                req->output_rkey,                       // rkey
+                                0,                // local_src
+                                mr_images_out->lkey,                    // lkey
+                                (uint64_t)KILL_SERVER, // wr_id
+                                (uint32_t *)&req->request_id);          // immediate
+                        } else {
+                            printf("Unexpected error\n");
+                            assert(false);
+                        }
+                    break;
+                    default:
+                        printf("Unexpected completion\n");
+                        assert(false);
+                }
+            }
+        }
+    }
+
+    void init_rdma_connection_info(rdma_connection_info *info) {
+        info->images_in_rkey = this->mr_images_in->rkey;
+        info->images_in_addr = (uintptr_t)this->mr_images_in->addr;
+
+        info->images_out_rkey = this->mr_images_out->rkey;
+        info->images_out_addr = (uintptr_t)this->mr_images_out->addr;
+
+        info->tasks_queue_rkey = mr_tasks_queue->rkey;
+        info->tasks_queue_addr = (uintptr_t)tasks_queue;
+
+        info->tasks_head_rkey = mr_tasks_head->rkey;
+        info->tasks_head_addr = (uintptr_t)tasks_head;
+
+        info->tasks_tail_rkey = mr_tasks_tail->rkey;
+        info->tasks_tail_addr = (uintptr_t)tasks_tail;
+
+        info->results_queue_rkey = mr_results_queue->rkey;
+        info->results_queue_addr = (uintptr_t)results_queue;
+
+        info->results_head_rkey = mr_results_head->rkey;
+        info->results_head_addr = (uintptr_t)results_head;
+
+        info->results_tail_rkey = mr_results_tail->rkey;
+        info->results_tail_addr = (uintptr_t)results_tail;
+
+        info->queue_size = queue_size;
     }
 };
 
@@ -343,14 +493,25 @@ class client_queues_context : public rdma_client_context {
 private:
     /* TODO add necessary context to track the client side of the GPU's
      * producer/consumer queues */
+    uint32_t requests_sent = 0;
+    uint32_t send_cqes_received = 0;
+
+    // Data_elements to send and recieve data
+    data_element sending_data = {};
+    data_element recieved_data = {};
+
+    uchar* images_out_addr;
+
+    struct ibv_mr *mr_sending_data_element;
+    struct ibv_mr *mr_recieved_data_element;
 
     struct ibv_mr *mr_images_in; /* Memory region for input images */
     struct ibv_mr *mr_images_out; /* Memory region for output images */
     /* TODO define other memory regions used by the client here */
-    struct ibv_mr *mr_tasks_MPMCqueue;      // Memory region for tasks MPMCqueue
-    struct ibv_mr *mr_results_MPMCqueue;    // Memory region for results MPMCqueue
-    struct ibv_mr *mr_tasks_queue;          // Memory region for tasks queue
-    struct ibv_mr *mr_results_queue;        // Memory region for results queue
+    rdma_connection_info remote_info;
+
+    rdma_queues_indexes queues_indexes;
+    struct ibv_mr *mr_queues_indexes;
 
 public:
     client_queues_context(uint16_t tcp_port) : rdma_client_context(tcp_port)
@@ -358,16 +519,47 @@ public:
         /* TODO communicate with server to discover number of queues, necessary
          * rkeys / address, or other additional information needed to operate
          * the GPU queues remotely. */
-        connection_info info;
-        if (recv(this->socket_fd, &info, sizeof(info), 0) < 0) {
-            perror("recv() failed");
-            exit(1);
-        }
+        recv_over_socket(&remote_info, sizeof(rdma_connection_info));
+        init_mr_data_elements();
+        init_mr_queues_indexes();
     }
 
     ~client_queues_context()
     {
-	/* TODO terminate the server and release memory regions and other resources */
+        /* terminate the server */
+        kill();
+
+        /* release memory regions and other resources */
+        ibv_dereg_mr(mr_queues_indexes);
+        ibv_dereg_mr(mr_recieved_data_element);
+        ibv_dereg_mr(mr_sending_data_element);
+        ibv_dereg_mr(mr_images_out);
+        ibv_dereg_mr(mr_images_out);
+    }
+
+    void init_mr_data_elements() {
+        mr_sending_data_element = ibv_reg_mr(pd, &sending_data, sizeof(data_element), IBV_ACCESS_LOCAL_WRITE);
+        if (!mr_sending_data_element) {
+            perror("ibv_reg_mr() failed for sending data element");
+            exit(1);
+        }
+        mr_recieved_data_element = ibv_reg_mr(pd, &recieved_data, sizeof(data_element), IBV_ACCESS_LOCAL_WRITE);
+        if (!mr_recieved_data_element) {
+            perror("ibv_reg_mr() failed for recieved data element");
+            exit(1);
+        }
+    }
+
+    void init_mr_queues_indexes() {
+        queues_indexes.tasks_head = 0;
+        queues_indexes.tasks_tail = 0;
+        queues_indexes.results_head = 0;
+        queues_indexes.results_tail = 0;
+        mr_queues_indexes = ibv_reg_mr(pd, &queues_indexes, sizeof(rdma_queues_indexes), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
+        if (!mr_queues_indexes) {
+            perror("ibv_reg_mr() failed for queues indexes");
+            exit(1);
+        }
     }
 
     virtual void set_input_images(uchar *images_in, size_t bytes) override
@@ -397,7 +589,32 @@ public:
         /* TODO use RDMA Write and RDMA Read operations to enqueue the task on
          * a CPU-GPU producer consumer queue running on the server. */
 
-        return false;
+        // read _head from remote tasks
+        read_index(HEAD);
+
+        // check if full
+        if (queues_indexes.tasks_tail - queues_indexes.tasks_head == remote_info.queue_size) {
+            return false;
+        }
+
+        // copy in image to server
+        uchar *remote_image_in = (uchar *)remote_info.images_in_addr;
+        uchar *image_in_dst = &remote_image_in[(img_id % OUTSTANDING_REQUESTS) * IMG_SZ];
+        copy_image(queues_indexes.tasks_tail, img_in, image_in_dst, COPY_TO_SERVER);
+
+        uchar *remote_image_out = (uchar *)remote_info.images_out_addr;
+        uchar *image_out_dst = &remote_image_out[(img_id % OUTSTANDING_REQUESTS) * IMG_SZ];
+
+        // create matching data element
+        sending_data = {img_id, image_in_dst, image_out_dst};
+
+        // insert data element in task queue
+        enqueue_data_element(queues_indexes.tasks_tail, &sending_data);
+
+        // update tasks _tail index
+        update_index(TAIL);
+
+        return true;
     }
 
     virtual bool dequeue(int *img_id) override
@@ -405,7 +622,309 @@ public:
         /* TODO use RDMA Write and RDMA Read operations to detect the completion and dequeue a processed image
          * through a CPU-GPU producer consumer queue running on the server. */
 
-        return false;
+        // read _tail from remote results
+        read_index(TAIL);
+
+        // check if empty
+        if (queues_indexes.results_tail == queues_indexes.results_head) {
+            return false;
+        }
+
+        // read data element from results queue
+        dequeue_data_element(queues_indexes.results_head, &recieved_data);
+
+        // copy out image to client
+        uchar *remote_image_out = (uchar *)remote_info.images_out_addr;
+        uchar *image_out_src = &remote_image_out[(recieved_data.img_id % OUTSTANDING_REQUESTS) * IMG_SZ];
+        copy_image(queues_indexes.results_head, image_out_src, recieved_data.img_out, COPY_FROM_SERVER);
+
+        // set image id
+        *img_id = recieved_data.img_id;
+
+        // update results _head index
+        update_index(HEAD);
+
+        return true;
+    }
+
+// go over the functions really carefully
+    void read_index(bool flag) {
+        // can stay normal reads
+        void *local_dst = NULL;
+        uint64_t remote_src = 0;    
+        uint32_t rkey = 0;    
+        uint64_t wr_id = 0;
+        int ncqes = 0;
+
+        if(flag == TAIL) {
+            local_dst = &indexes.gtc_tail;
+            remote_src = remote_info.gtc_tail_addr;    // remote_src
+            rkey = remote_info.gtc_indexes_rkey;    // rkey
+            wr_id = indexes.gtc_tail;
+        } else {
+            local_dst = &indexes.ctg_head;
+            remote_src = remote_info.ctg_head_addr;    // remote_src
+            rkey = remote_info.ctg_indexes_rkey;    // rkey
+            wr_id = indexes.ctg_head;
+        }
+
+
+        post_rdma_read(local_dst,           // local_dst
+                       atomic_int_size,     // len
+                       mr_indexes->lkey,    // lkey
+                       remote_src,          // remote_src
+                       rkey,                // rkey
+                       wr_id);              // wr_id
+
+        //check for CQE
+        struct ibv_wc wc;
+        do {
+            ncqes = ibv_poll_cq(cq, 1, &wc);
+        } while(ncqes == 0);
+
+        if (ncqes < 0) {
+            perror("ibv_poll_cq() failed");
+            exit(1);
+        }
+        VERBS_WC_CHECK(wc);
+        if(wc.opcode != IBV_WC_RDMA_READ) {
+            exit(1);
+        }
+    }
+
+    void copy_image(size_t index, uchar* src, uchar* dst, bool flag) {
+        int ncqes = 0;
+        if (flag == COPY_TO_SERVER) {
+            post_rdma_write(
+                (uint64_t)dst,                  // remote_dst
+                IMG_SZ,                         // len
+                remote_info.images_in_rkey,     // rkey
+                src,                            // local_src
+                mr_images_in->lkey,             // lkey
+                index,                          // wr_id
+                nullptr); 
+        } else { // flag == COPY_FROM_SERVER
+            post_rdma_read(
+                (void *)src,                    // local_dst
+                IMG_SZ,                         // len
+                mr_images_out->lkey,            // lkey
+                (uintptr_t)dst,                 // remote_src
+                remote_info.images_out_rkey,    // rkey
+                index);                         // wr_id
+        }
+        struct ibv_wc wc;
+            
+        do {
+            ncqes = ibv_poll_cq(cq, 1, &wc);
+        } while(ncqes == 0);
+
+        if (ncqes < 0) {
+            perror("ibv_poll_cq() failed");
+            exit(1);
+        }
+        VERBS_WC_CHECK(wc);
+        if (flag == COPY_TO_SERVER) {
+            if(wc.opcode != IBV_WC_RDMA_WRITE) {
+                perror("write image failed");
+                exit(1);
+            }
+            return;
+        }
+        if(flag == COPY_FROM_SERVER) {
+            if(wc.opcode != IBV_WC_RDMA_READ) {
+                perror("read image failed");
+                exit(1);
+            }
+            return;
+        }
+        perror("unexpected error");
+        exit(1);
+    }
+
+    void enqueue_data_element(size_t index, data_element *data) {
+        Job * remote_jobs_queue = (Job *)remote_info.ctg_queue_addr;
+        uint64_t remote_job_addr = (uintptr_t)&remote_jobs_queue[index%remote_info.number_of_slots];
+        //printf("index : %d\n", index);
+        post_rdma_write(
+            remote_job_addr,                       // remote_dst
+            job_size,                              // len
+            remote_info.ctg_queue_rkey,            // rkey
+            job,                                   // local_src
+            mr_sending_job->lkey,                  // lkey
+            index,                                 // wr_id
+            nullptr); 
+            
+        struct ibv_wc wc; 
+        int ncqes = 0;
+        do{
+            ncqes = ibv_poll_cq(cq, 1, &wc);
+        }while(ncqes == 0);
+
+        if (ncqes < 0) 
+        {
+            perror("ibv_poll_cq() failed");
+            exit(1);
+        }
+        VERBS_WC_CHECK(wc);
+        if( wc.opcode != IBV_WC_RDMA_WRITE)
+        {
+            perror("enqueue job failed");
+            exit(1);
+        }
+
+    }
+
+    void dequeue_data_element(size_t index, data_element *data) {
+        Job * remote_job = (Job *)remote_info.gtc_queue_addr;
+        uint64_t remote_job_addr = (uintptr_t)&remote_job[index%remote_info.number_of_slots];
+
+        post_rdma_read(
+            job,                           // local_dst
+            job_size,                               // len
+            mr_recieved_job->lkey,                  // lkey
+            remote_job_addr,              // remote_src
+            remote_info.gtc_queue_rkey,            // rkey
+            index); 
+            
+        struct ibv_wc wc; 
+        int ncqes = 0;
+        do{
+            ncqes = ibv_poll_cq(cq, 1, &wc);
+        }while(ncqes == 0);
+
+        if (ncqes < 0) 
+        {
+            perror("ibv_poll_cq() failed");
+            exit(1);
+        }
+        VERBS_WC_CHECK(wc);
+        if( wc.opcode != IBV_WC_RDMA_READ)
+        {
+            perror("dequeue job failed");
+            exit(1);
+        }                                  // wr_id
+    }
+
+    void update_index(bool flag) {
+        // see about making this an atomic operation
+        void *local_src = NULL;
+        uint64_t remote_dst = 0;  
+        uint32_t rkey = 0;    
+        uint64_t wr_id = 0;
+        int ncqes = 0;
+        if(flag == TAIL) {
+            indexes.ctg_tail++;
+            local_src = &indexes.ctg_tail;
+            remote_dst = remote_info.ctg_tail_addr;    // remote_src
+            rkey = remote_info.ctg_indexes_rkey;    // rkey
+            wr_id = indexes.ctg_tail;
+        } else { // flag == HEAD
+            indexes.gtc_head++;
+            local_src = &indexes.gtc_head;
+            remote_dst = remote_info.gtc_head_addr;    // remote_src
+            rkey = remote_info.gtc_indexes_rkey;    // rkey
+            wr_id = indexes.gtc_head+2000; 
+        }
+
+
+        post_rdma_write(
+            remote_dst,                        // remote_dst
+            atomic_int_size,                   // len
+            rkey,                              // rkey
+            local_src,                         // local_src
+            mr_indexes->lkey,                  // lkey
+            wr_id,                             // wr_id
+            nullptr);  
+        //check for CQE
+        struct ibv_wc wc;
+        do {
+            ncqes = ibv_poll_cq(cq, 1, &wc);
+        } while(ncqes == 0);
+
+        if (ncqes < 0) {
+            perror("ibv_poll_cq() failed");
+            exit(1);
+        }
+
+        VERBS_WC_CHECK(wc);
+        if(wc.opcode != IBV_WC_RDMA_WRITE) {
+            perror("write index failed");
+            exit(1);
+        }
+    }
+
+    void sendTermination() {
+        struct ibv_sge sg; /* scatter/gather element */
+        struct ibv_send_wr wr; /* WQE */
+        struct ibv_send_wr *bad_wr; /* ibv_post_send() reports bad WQEs here */
+
+        /* step 1: send killing request to server using Send operation */
+        
+        struct rpc_request *req = &requests[requests_sent % OUTSTANDING_REQUESTS];
+        req->request_id = KILL_SERVER;
+        req->input_rkey = 0;
+        req->input_addr = (uintptr_t)nullptr;
+        req->input_length = IMG_SZ;
+        req->output_rkey = 0;
+        req->output_addr = (uintptr_t)nullptr;
+        req->output_length = IMG_SZ;
+
+        /* RDMA send needs a gather element (local buffer)*/
+        memset(&sg, 0, sizeof(struct ibv_sge));
+        sg.addr = (uintptr_t)req;
+        sg.length = sizeof(*req);
+        sg.lkey = mr_requests->lkey;
+
+        /* WQE */
+        memset(&wr, 0, sizeof(struct ibv_send_wr));
+        wr.wr_id = (uint64_t)KILL_SERVER; /* helps identify the WQE */
+        wr.sg_list = &sg;
+        wr.num_sge = 1;
+        wr.opcode = IBV_WR_SEND;
+        wr.send_flags = IBV_SEND_SIGNALED; /* always set this in this excersize. generates CQE */
+
+        /* post the WQE to the HCA to execute it */
+        if (ibv_post_send(qp, &wr, &bad_wr)) {
+            perror("ibv_post_send() failed");
+            exit(1);
+        }
+    }
+
+    bool getTermination(int *img_id) {
+        struct ibv_wc wc; /* CQE */
+        int ncqes = ibv_poll_cq(cq, 1, &wc);
+        if (ncqes < 0) {
+            perror("ibv_poll_cq() failed");
+            exit(1);
+        }
+        if (ncqes == 0)
+            return false;
+
+	    VERBS_WC_CHECK(wc);
+
+        switch (wc.opcode) {
+        case IBV_WC_SEND:
+            return false;
+        case IBV_WC_RECV_RDMA_WITH_IMM:
+            *img_id = wc.imm_data;
+            break;
+        default:
+            printf("Unexpected completion type\n");
+            assert(0);
+        }
+        if(*img_id != KILL_SERVER)
+            printf("Unexpected request\n");
+        return true;
+    }
+
+    void kill() {
+        sendTermination();
+
+        int img_id = 0;
+        bool dequeued;
+        do {
+            dequeued = getTermination(&img_id);
+        } while (!dequeued || img_id != -1);
     }
 };
 

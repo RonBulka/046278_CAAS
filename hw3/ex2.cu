@@ -23,17 +23,40 @@ typedef struct task_metadata_t {
     int status;  // 0: pending, 1: processing, 2: completed
 } task_metadata;
 
-typedef struct connection_info_t {
-    uint32_t tasks_MPMCqueue_rkey;
-    uint64_t tasks_MPMCqueue_addr;
-    uint32_t results_MPMCqueue_rkey;
-    uint64_t results_MPMCqueue_addr;
+typedef struct rdma_connection_info_t {
+    uint32_t images_in_rkey;
+    uint64_t images_in_addr;
+
+    uint32_t images_out_rkey;
+    uint64_t images_out_addr;
+
     uint32_t tasks_queue_rkey;
     uint64_t tasks_queue_addr;
+
+    uint32_t tasks_head_rkey;
+    uint64_t tasks_head_addr;
+
+    uint32_t tasks_tail_rkey;
+    uint64_t tasks_tail_addr;
+
     uint32_t results_queue_rkey;
     uint64_t results_queue_addr;
+
+    uint32_t results_head_rkey;
+    uint64_t results_head_addr;
+
+    uint32_t results_tail_rkey;
+    uint64_t results_tail_addr;
+
     size_t queue_size;
-} connection_info;
+} rdma_connection_info;
+
+typedef struct rdma_queues_indexes_t {
+    size_t tasks_head;
+    size_t tasks_tail;
+    size_t results_head;
+    size_t results_tail;
+} rdma_queues_indexes;
 
 __global__ void persistent_kernel(uchar* maps, MPMCqueue* tasks, MPMCqueue* results, cuda::atomic<bool>* stop_kernel);
 __device__ void debug_msg(const char* msg, int hist[], int hist_size);
@@ -253,6 +276,14 @@ public:
 
     data_element* get_queue() {
         return queue;
+    }
+
+    cuda::atomic<size_t>* get__head() {
+        return this->_head;
+    }
+
+    cuda::atomic<size_t>* get__tail() {
+        return this->_tail;
     }
 
     __device__ bool gpu_push(const data_element &item) {

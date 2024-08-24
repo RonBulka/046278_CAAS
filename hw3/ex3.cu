@@ -577,7 +577,7 @@ public:
     {
         // TODO register memory
         /* register a memory region for the output images. */
-        mr_images_out = ibv_reg_mr(pd, images_out, bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        mr_images_out = ibv_reg_mr(pd, images_out, bytes, IBV_ACCESS_LOCAL_WRITE);
         if (!mr_images_out) {
             perror("ibv_reg_mr() failed for output images");
             exit(1);
@@ -657,24 +657,23 @@ public:
         int ncqes = 0;
 
         if(flag == TAIL) {
-            local_dst = &indexes.gtc_tail;
-            remote_src = remote_info.gtc_tail_addr;    // remote_src
-            rkey = remote_info.gtc_indexes_rkey;    // rkey
-            wr_id = indexes.gtc_tail;
-        } else {
-            local_dst = &indexes.ctg_head;
-            remote_src = remote_info.ctg_head_addr;    // remote_src
-            rkey = remote_info.ctg_indexes_rkey;    // rkey
-            wr_id = indexes.ctg_head;
+            local_dst = &queues_indexes.results_tail;
+            remote_src = remote_info.results_tail_addr;     // remote_src
+            rkey = remote_info.results_tail_rkey;           // rkey
+            wr_id = queues_indexes.results_tail;
+        } else { // flag == HEAD
+            local_dst = &queues_indexes.tasks_head;
+            remote_src = remote_info.tasks_head_addr;       // remote_src
+            rkey = remote_info.tasks_head_rkey;             // rkey
+            wr_id = queues_indexes.tasks_head;
         }
 
-
-        post_rdma_read(local_dst,           // local_dst
-                       atomic_int_size,     // len
-                       mr_indexes->lkey,    // lkey
-                       remote_src,          // remote_src
-                       rkey,                // rkey
-                       wr_id);              // wr_id
+        post_rdma_read(local_dst,                   // local_dst
+                       sizeof(size_t),              // len
+                       mr_queues_indexes->lkey,     // lkey
+                       remote_src,                  // remote_src
+                       rkey,                        // rkey
+                       wr_id);                      // wr_id
 
         //check for CQE
         struct ibv_wc wc;
@@ -688,6 +687,53 @@ public:
         }
         VERBS_WC_CHECK(wc);
         if(wc.opcode != IBV_WC_RDMA_READ) {
+            exit(1);
+        }
+    }
+
+    void update_index(bool flag) {
+        // see about making this an atomic operation
+        void *local_src = NULL;
+        uint64_t remote_dst = 0;  
+        uint32_t rkey = 0;    
+        uint64_t wr_id = 0;
+        int ncqes = 0;
+        if(flag == TAIL) {
+            queues_indexes.tasks_tail++;                // update local index
+            local_src = &queues_indexes.tasks_tail;
+            remote_dst = remote_info.tasks_tail_addr;   // remote_src
+            rkey = remote_info.tasks_tail_rkey;         // rkey
+            wr_id = queues_indexes.tasks_tail;
+        } else { // flag == HEAD
+            queues_indexes.results_head++;
+            local_src = &queues_indexes.results_head;
+            remote_dst = remote_info.results_head_addr; // remote_src
+            rkey = remote_info.results_head_rkey;       // rkey
+            wr_id = queues_indexes.results_head + remote_info.queue_size; 
+        }
+
+        post_rdma_write(
+            remote_dst,                 // remote_dst
+            sizeof(size_t),             // len
+            rkey,                       // rkey
+            local_src,                  // local_src
+            mr_queues_indexes->lkey,    // lkey
+            wr_id,                      // wr_id
+            nullptr);  
+        //check for CQE
+        struct ibv_wc wc;
+        do {
+            ncqes = ibv_poll_cq(cq, 1, &wc);
+        } while(ncqes == 0);
+
+        if (ncqes < 0) {
+            perror("ibv_poll_cq() failed");
+            exit(1);
+        }
+
+        VERBS_WC_CHECK(wc);
+        if(wc.opcode != IBV_WC_RDMA_WRITE) {
+            perror("write index failed");
             exit(1);
         }
     }
@@ -730,7 +776,7 @@ public:
             }
             return;
         }
-        if(flag == COPY_FROM_SERVER) {
+        if (flag == COPY_FROM_SERVER) {
             if(wc.opcode != IBV_WC_RDMA_READ) {
                 perror("read image failed");
                 exit(1);
@@ -742,16 +788,16 @@ public:
     }
 
     void enqueue_data_element(size_t index, data_element *data) {
-        Job * remote_jobs_queue = (Job *)remote_info.ctg_queue_addr;
-        uint64_t remote_job_addr = (uintptr_t)&remote_jobs_queue[index%remote_info.number_of_slots];
+        data_element *remote_tasks_queue = (data_element *)remote_info.tasks_queue_addr;
+        uint64_t remote_task_addr = (uintptr_t)&remote_tasks_queue[index % remote_info.queue_size];
         //printf("index : %d\n", index);
         post_rdma_write(
-            remote_job_addr,                       // remote_dst
-            job_size,                              // len
-            remote_info.ctg_queue_rkey,            // rkey
-            job,                                   // local_src
-            mr_sending_job->lkey,                  // lkey
-            index,                                 // wr_id
+            remote_task_addr,               // remote_dst
+            sizeof(data_element),           // len
+            remote_info.tasks_queue_rkey,   // rkey
+            data,                           // local_src
+            mr_sending_data_element->lkey,  // lkey
+            index,                          // wr_id
             nullptr); 
             
         struct ibv_wc wc; 
@@ -775,68 +821,19 @@ public:
     }
 
     void dequeue_data_element(size_t index, data_element *data) {
-        Job * remote_job = (Job *)remote_info.gtc_queue_addr;
-        uint64_t remote_job_addr = (uintptr_t)&remote_job[index%remote_info.number_of_slots];
+        data_element *remote_results_queue = (data_element *)remote_info.results_queue_addr;
+        uint64_t remote_result_addr = (uintptr_t)&remote_results_queue[index % remote_info.queue_size];
 
         post_rdma_read(
-            job,                           // local_dst
-            job_size,                               // len
-            mr_recieved_job->lkey,                  // lkey
-            remote_job_addr,              // remote_src
-            remote_info.gtc_queue_rkey,            // rkey
-            index); 
+            data,                           // local_dst
+            sizeof(data_element),           // len
+            mr_recieved_data_element->lkey, // lkey
+            remote_result_addr,             // remote_src
+            remote_info.results_queue_rkey, // rkey
+            index);                         // wr_id
             
         struct ibv_wc wc; 
         int ncqes = 0;
-        do{
-            ncqes = ibv_poll_cq(cq, 1, &wc);
-        }while(ncqes == 0);
-
-        if (ncqes < 0) 
-        {
-            perror("ibv_poll_cq() failed");
-            exit(1);
-        }
-        VERBS_WC_CHECK(wc);
-        if( wc.opcode != IBV_WC_RDMA_READ)
-        {
-            perror("dequeue job failed");
-            exit(1);
-        }                                  // wr_id
-    }
-
-    void update_index(bool flag) {
-        // see about making this an atomic operation
-        void *local_src = NULL;
-        uint64_t remote_dst = 0;  
-        uint32_t rkey = 0;    
-        uint64_t wr_id = 0;
-        int ncqes = 0;
-        if(flag == TAIL) {
-            indexes.ctg_tail++;
-            local_src = &indexes.ctg_tail;
-            remote_dst = remote_info.ctg_tail_addr;    // remote_src
-            rkey = remote_info.ctg_indexes_rkey;    // rkey
-            wr_id = indexes.ctg_tail;
-        } else { // flag == HEAD
-            indexes.gtc_head++;
-            local_src = &indexes.gtc_head;
-            remote_dst = remote_info.gtc_head_addr;    // remote_src
-            rkey = remote_info.gtc_indexes_rkey;    // rkey
-            wr_id = indexes.gtc_head+2000; 
-        }
-
-
-        post_rdma_write(
-            remote_dst,                        // remote_dst
-            atomic_int_size,                   // len
-            rkey,                              // rkey
-            local_src,                         // local_src
-            mr_indexes->lkey,                  // lkey
-            wr_id,                             // wr_id
-            nullptr);  
-        //check for CQE
-        struct ibv_wc wc;
         do {
             ncqes = ibv_poll_cq(cq, 1, &wc);
         } while(ncqes == 0);
@@ -845,13 +842,14 @@ public:
             perror("ibv_poll_cq() failed");
             exit(1);
         }
-
         VERBS_WC_CHECK(wc);
-        if(wc.opcode != IBV_WC_RDMA_WRITE) {
-            perror("write index failed");
+        if(wc.opcode != IBV_WC_RDMA_READ) {
+            perror("dequeue job failed");
             exit(1);
         }
     }
+
+    
 
     void sendTermination() {
         struct ibv_sge sg; /* scatter/gather element */

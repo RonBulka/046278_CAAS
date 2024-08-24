@@ -395,8 +395,6 @@ public:
 
     ~server_queues_context() {
         /* TODO destroy the additional server MRs here */
-        ibv_dereg_mr(this->mr_images_in);
-        ibv_dereg_mr(this->mr_images_out);
 
         ibv_dereg_mr(this->mr_tasks_queue);
         ibv_dereg_mr(this->mr_tasks_head);
@@ -406,9 +404,7 @@ public:
         ibv_dereg_mr(this->mr_results_head);
         ibv_dereg_mr(this->mr_results_tail);
 
-        free(this->images_in);
-        free(this->images_out);
-        server->~queue_server();
+        // server->~queue_server();
     }
 
     virtual void event_loop() override {
@@ -528,12 +524,11 @@ public:
     {
         /* terminate the server */
         kill();
-
         /* release memory regions and other resources */
         ibv_dereg_mr(mr_queues_indexes);
         ibv_dereg_mr(mr_recieved_data_element);
         ibv_dereg_mr(mr_sending_data_element);
-        ibv_dereg_mr(mr_images_out);
+        ibv_dereg_mr(mr_images_in);
         ibv_dereg_mr(mr_images_out);
     }
 
@@ -582,6 +577,7 @@ public:
             perror("ibv_reg_mr() failed for output images");
             exit(1);
         }
+        images_out_addr = images_out;
     }
 
     virtual bool enqueue(int img_id, uchar *img_in, uchar *img_out) override
@@ -634,9 +630,8 @@ public:
         dequeue_data_element(queues_indexes.results_head, &recieved_data);
 
         // copy out image to client
-        uchar *remote_image_out = (uchar *)remote_info.images_out_addr;
-        uchar *image_out_src = &remote_image_out[(recieved_data.img_id % OUTSTANDING_REQUESTS) * IMG_SZ];
-        copy_image(queues_indexes.results_head, image_out_src, recieved_data.img_out, COPY_FROM_SERVER);
+        uchar *local_image_out = &images_out_addr[(recieved_data.img_id % N_IMAGES) * IMG_SZ];
+        copy_image(queues_indexes.results_head, local_image_out, recieved_data.img_out, COPY_FROM_SERVER);
 
         // set image id
         *img_id = recieved_data.img_id;
@@ -741,6 +736,7 @@ public:
     void copy_image(size_t index, uchar* src, uchar* dst, bool flag) {
         int ncqes = 0;
         if (flag == COPY_TO_SERVER) {
+            // printf("copying image to server\n");
             post_rdma_write(
                 (uint64_t)dst,                  // remote_dst
                 IMG_SZ,                         // len
@@ -750,8 +746,9 @@ public:
                 index,                          // wr_id
                 nullptr); 
         } else { // flag == COPY_FROM_SERVER
+            // printf("copying image from server\n");
             post_rdma_read(
-                (void *)src,                    // local_dst
+                src,                            // local_dst
                 IMG_SZ,                         // len
                 mr_images_out->lkey,            // lkey
                 (uintptr_t)dst,                 // remote_src
@@ -846,8 +843,6 @@ public:
             exit(1);
         }
     }
-
-    
 
     void sendTermination() {
         struct ibv_sge sg; /* scatter/gather element */

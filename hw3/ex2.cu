@@ -18,11 +18,6 @@ typedef struct data_element_t {
     uchar *img_out;
 } data_element;
 
-typedef struct task_metadata_t {
-    int img_id;
-    int status;  // 0: pending, 1: processing, 2: completed
-} task_metadata;
-
 typedef struct rdma_connection_info_t {
     uint32_t images_in_rkey;
     uint64_t images_in_addr;

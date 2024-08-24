@@ -656,7 +656,7 @@ public:
         uint64_t wr_id = 0;
         int ncqes = 0;
 
-        if(flag == TAIL) {
+        if (flag == TAIL) {
             local_dst = &queues_indexes.results_tail;
             remote_src = remote_info.results_tail_addr;     // remote_src
             rkey = remote_info.results_tail_rkey;           // rkey
@@ -686,7 +686,7 @@ public:
             exit(1);
         }
         VERBS_WC_CHECK(wc);
-        if(wc.opcode != IBV_WC_RDMA_READ) {
+        if (wc.opcode != IBV_WC_RDMA_READ) {
             exit(1);
         }
     }
@@ -698,7 +698,7 @@ public:
         uint32_t rkey = 0;    
         uint64_t wr_id = 0;
         int ncqes = 0;
-        if(flag == TAIL) {
+        if (flag == TAIL) {
             queues_indexes.tasks_tail++;                // update local index
             local_src = &queues_indexes.tasks_tail;
             remote_dst = remote_info.tasks_tail_addr;   // remote_src
@@ -732,7 +732,7 @@ public:
         }
 
         VERBS_WC_CHECK(wc);
-        if(wc.opcode != IBV_WC_RDMA_WRITE) {
+        if (wc.opcode != IBV_WC_RDMA_WRITE) {
             perror("write index failed");
             exit(1);
         }
@@ -802,18 +802,16 @@ public:
             
         struct ibv_wc wc; 
         int ncqes = 0;
-        do{
+        do {
             ncqes = ibv_poll_cq(cq, 1, &wc);
-        }while(ncqes == 0);
+        } while(ncqes == 0);
 
-        if (ncqes < 0) 
-        {
+        if (ncqes < 0) {
             perror("ibv_poll_cq() failed");
             exit(1);
         }
         VERBS_WC_CHECK(wc);
-        if( wc.opcode != IBV_WC_RDMA_WRITE)
-        {
+        if (wc.opcode != IBV_WC_RDMA_WRITE) {
             perror("enqueue job failed");
             exit(1);
         }
@@ -843,7 +841,7 @@ public:
             exit(1);
         }
         VERBS_WC_CHECK(wc);
-        if(wc.opcode != IBV_WC_RDMA_READ) {
+        if (wc.opcode != IBV_WC_RDMA_READ) {
             perror("dequeue job failed");
             exit(1);
         }
@@ -910,7 +908,7 @@ public:
             printf("Unexpected completion type\n");
             assert(0);
         }
-        if(*img_id != KILL_SERVER)
+        if (*img_id != KILL_SERVER)
             printf("Unexpected request\n");
         return true;
     }
@@ -950,5 +948,4 @@ std::unique_ptr<rdma_client_context> create_client(mode_enum mode, uint16_t tcp_
         printf("Unknown mode.\n");
         exit(1);
     }
-    
 }
